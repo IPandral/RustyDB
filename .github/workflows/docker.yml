@@ -1,0 +1,268 @@
+# GitHub Actions Workflow: Docker Build and Test
+# Builds the RustyDB Docker image and verifies it works correctly
+
+name: Docker Build & Test
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - '.github/workflows/docker.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - '.github/workflows/docker.yml'
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  IMAGE_NAME: rustydb
+  REGISTRY: ghcr.io
+
+jobs:
+  # ===========================================================================
+  # Build and Test Docker Image
+  # ===========================================================================
+  build-and-test:
+    name: Build & Test Docker Image
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start container
+        run: |
+          docker run -d \
+            --name rustydb-test \
+            -p 8080:8080 \
+            -e RUSTYDB_USERNAME=testuser \
+            -e RUSTYDB_PASSWORD=testpass123 \
+            -e RUSTYDB_MEMORY_ONLY=true \
+            ${{ env.IMAGE_NAME }}:test
+          
+          # Wait for container to be ready
+          echo "Waiting for container to start..."
+          sleep 5
+
+      - name: Check container is running
+        run: |
+          if ! docker ps | grep rustydb-test; then
+            echo "Container failed to start!"
+            docker logs rustydb-test
+            exit 1
+          fi
+          echo "Container is running"
+
+      - name: Test health endpoint
+        run: |
+          echo "Testing health endpoint..."
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health)
+          if [ "$RESPONSE" != "200" ]; then
+            echo "Health check failed with status: $RESPONSE"
+            docker logs rustydb-test
+            exit 1
+          fi
+          echo "Health check passed!"
+          curl -s http://localhost:8080/health | jq .
+
+      - name: Test authentication required
+        run: |
+          echo "Testing that auth is required..."
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/kv/test)
+          if [ "$RESPONSE" != "401" ]; then
+            echo "Expected 401 Unauthorized, got: $RESPONSE"
+            exit 1
+          fi
+          echo "Auth requirement verified!"
+
+      - name: Test KV operations
+        run: |
+          AUTH="testuser:testpass123"
+          
+          echo "Testing SET operation..."
+          curl -s -u $AUTH -X PUT http://localhost:8080/kv/greeting \
+            -H "Content-Type: application/json" \
+            -d '{"value": "Hello, RustyDB!"}' | jq .
+          
+          echo "Testing GET operation..."
+          RESULT=$(curl -s -u $AUTH http://localhost:8080/kv/greeting)
+          echo "$RESULT" | jq .
+          
+          VALUE=$(echo "$RESULT" | jq -r '.data.value')
+          if [ "$VALUE" != "Hello, RustyDB!" ]; then
+            echo "GET returned unexpected value: $VALUE"
+            exit 1
+          fi
+          echo "KV operations passed!"
+
+      - name: Test SQL operations
+        run: |
+          AUTH="testuser:testpass123"
+          
+          echo "Testing CREATE TABLE..."
+          curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+            -H "Content-Type: application/json" \
+            -d '{"query": "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)"}' | jq .
+          
+          echo "Testing INSERT..."
+          curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+            -H "Content-Type: application/json" \
+            -d '{"query": "INSERT INTO users VALUES (1, '\''Alice'\'', '\''alice@example.com'\'')"}' | jq .
+          
+          curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+            -H "Content-Type: application/json" \
+            -d '{"query": "INSERT INTO users VALUES (2, '\''Bob'\'', '\''bob@example.com'\'')"}' | jq .
+          
+          echo "Testing SELECT..."
+          RESULT=$(curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+            -H "Content-Type: application/json" \
+            -d '{"query": "SELECT * FROM users"}')
+          echo "$RESULT" | jq .
+          
+          ROW_COUNT=$(echo "$RESULT" | jq -r '.data.rows | length')
+          if [ "$ROW_COUNT" != "2" ]; then
+            echo "Expected 2 rows, got: $ROW_COUNT"
+            exit 1
+          fi
+          
+          echo "Testing SELECT with WHERE..."
+          curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+            -H "Content-Type: application/json" \
+            -d '{"query": "SELECT name, email FROM users WHERE id = 1"}' | jq .
+          
+          echo "Testing UPDATE..."
+          curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+            -H "Content-Type: application/json" \
+            -d '{"query": "UPDATE users SET email = '\''alice.updated@example.com'\'' WHERE id = 1"}' | jq .
+          
+          echo "Testing DELETE..."
+          curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+            -H "Content-Type: application/json" \
+            -d '{"query": "DELETE FROM users WHERE id = 2"}' | jq .
+          
+          echo "Testing SHOW TABLES..."
+          curl -s -u $AUTH http://localhost:8080/sql/tables | jq .
+          
+          echo "SQL operations passed!"
+
+      - name: Test batch KV operations
+        run: |
+          AUTH="testuser:testpass123"
+          
+          echo "Testing MSET..."
+          curl -s -u $AUTH -X POST http://localhost:8080/kv/mset \
+            -H "Content-Type: application/json" \
+            -d '{"pairs": [{"key": "k1", "value": "v1"}, {"key": "k2", "value": "v2"}, {"key": "k3", "value": "v3"}]}' | jq .
+          
+          echo "Testing MGET..."
+          RESULT=$(curl -s -u $AUTH -X POST http://localhost:8080/kv/mget \
+            -H "Content-Type: application/json" \
+            -d '{"keys": ["k1", "k2", "k3"]}')
+          echo "$RESULT" | jq .
+          
+          COUNT=$(echo "$RESULT" | jq -r '.data | length')
+          if [ "$COUNT" != "3" ]; then
+            echo "Expected 3 keys, got: $COUNT"
+            exit 1
+          fi
+          echo "Batch operations passed!"
+
+      - name: Test store info
+        run: |
+          AUTH="testuser:testpass123"
+          
+          echo "Getting store info..."
+          curl -s -u $AUTH http://localhost:8080/kv/info | jq .
+          echo "Store info retrieved!"
+
+      - name: View container logs
+        if: always()
+        run: |
+          echo "=== Container Logs ==="
+          docker logs rustydb-test
+
+      - name: Stop and remove container
+        if: always()
+        run: |
+          docker stop rustydb-test || true
+          docker rm rustydb-test || true
+
+  # ===========================================================================
+  # Build and Push to GitHub Container Registry (on main branch only)
+  # ===========================================================================
+  push-to-registry:
+    name: Push to Registry
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=
+            type=ref,event=branch
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Image pushed successfully
+        run: |
+          echo "✅ Image pushed to ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}"
+          echo ""
+          echo "Pull with:"
+          echo "  docker pull ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest"
