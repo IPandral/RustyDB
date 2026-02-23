@@ -1,17 +1,17 @@
 # RustyDB
 
-A high-performance, in-memory database written in Rust with **full SQL support**, **MySQL wire protocol compatibility**, and crash-safe persistence. RustyDB combines the speed of in-memory storage with MySQL-compatible SQL syntax, delivering **50-3000x faster** performance than traditional databases for common operations.
+A lightweight, in-memory database written in Rust with **full SQL support**, **MySQL wire protocol compatibility**, and crash-safe persistence. RustyDB combines the simplicity of an embedded database with MySQL-compatible SQL syntax, letting you connect with any standard MySQL client.
 
 Connect with any standard MySQL client -- `mysql` CLI, Python (`mysql-connector-python`, `PyMySQL`), Rust (`mysql`, `mysql_async`), Node.js, and more.
 
 ## Project Goals
 
-- **50-3000x faster** than MySQL for SQL operations (CREATE: 1.7us vs 1-5ms, INSERT: 987ns vs 50-200us)
 - **Memory-first architecture** with full SQL support
 - **MySQL-compatible syntax and wire protocol** for drop-in client compatibility
 - **Lock-free concurrent access** for maximum throughput
 - **Crash-safe persistence** via write-ahead logging
 - **Dual-mode operation** - Key-Value store + SQL database
+- **Written in Rust** for safety and efficiency
 
 ## Features
 
@@ -487,29 +487,77 @@ cargo bench --bench stress_test_bench
 
 **Total: 75 tests** (29 unit + 4 database + 42 wire integration)
 
-## Performance Results
+## Performance
 
-**Benchmark Environment**: 
-Windows: AMD Ryzen 9 9950X3D (16 cores) with 32GB DDR5 RAM
-MacOS: Apple M3 Pro (12 cores) with 18GB unified memory
+### Benchmark Environment
 
-### SQL Performance vs MySQL
+- **macOS**: Apple M3 Pro (12 cores), 18GB unified memory
+- **MySQL 8.0**: Docker container with `tmpfs` (RAM-backed), tuned InnoDB settings
+- **RustyDB**: In-memory mode (`--memory`), MySQL wire protocol on port 3307
+- **Method**: 100 iterations, 10 warmup, single persistent connection per target
 
-| Operation | RustyDB | MySQL | Speedup |
-|-----------|---------|--------|---------|
-| CREATE TABLE | 1.7us | 1-5ms | **500-3000x** |
-| INSERT | 987ns | 50-200us | **50-200x** |
-| SELECT (1K rows) | 60us | 1-10ms | **17-167x** |
-| SELECT WHERE | 138us | 200-2000us | **1.4-14x** |
-| UPDATE | 54us | 100-1000us | **2-18x** |
-| DELETE | 942us | 200-2000us | **~2x** |
-| ORDER BY + LIMIT | 5.5us | 1-50ms | **180-9000x** |
+### SQL Performance (Wire Protocol vs MySQL 8.0)
+
+| Operation | RustyDB (ms) | MySQL (ms) | Notes |
+|-----------|-------------|-----------|-------|
+| CREATE TABLE | 6.97 | 4.81 | |
+| INSERT | 2.04 | 1.30 | |
+| SELECT * (1K rows) | 4.36 | 4.05 | |
+| SELECT WHERE = | 2.24 | 1.68 | |
+| SELECT WHERE > | 4.39 | 2.76 | |
+| SELECT WHERE AND | 2.12 | 1.49 | |
+| SELECT LIKE suffix | 3.62 | 2.18 | |
+| SELECT LIKE prefix | 2.13 | 1.27 | |
+| SELECT ORDER BY | 4.40 | 3.81 | |
+| SELECT ORDER BY LIMIT | 0.25 | 1.12 | RustyDB 4.4x faster |
+| UPDATE single row | 1.96 | 1.47 | |
+| UPDATE multi row | 2.05 | 1.28 | |
+| DELETE single row | 5.02 | 1.48 | |
+| Mixed workload | 1.45 | 1.27 | |
+| Table scan (100 rows) | 0.36 | 0.87 | RustyDB 2.4x faster |
+| Table scan (1K rows) | 4.99 | 3.88 | |
+| Table scan (10K rows) | 42.02 | 26.12 | |
+| Complex WHERE (orders) | 3.83 | 2.10 | |
+| Complex WHERE (users) | 2.50 | 1.80 | |
+
+*All times are median values in milliseconds. Lower is better.*
+
+These benchmarks measure **end-to-end wire protocol latency** (network + parsing + execution + serialization). RustyDB's native in-process API (measured via `cargo bench`) is significantly faster since it bypasses the wire protocol overhead.
 
 ### Key-Value Performance
 
 - **Reads (32 threads)**: ~1.1ms for 10K ops (~9M ops/sec)
 - **Writes (32 threads)**: ~970us for 10K ops (~10M ops/sec)
 - **Memory overhead**: ~24 bytes per key-value pair
+
+### Running Benchmarks
+
+```bash
+# Native Rust benchmarks (in-process, no wire protocol overhead)
+cargo bench
+cargo bench --bench sql_bench
+cargo bench --bench kv_bench
+
+# Wire protocol comparison vs MySQL
+# 1. Start MySQL container
+docker compose -f benches/compare/docker-compose.mysql.yml up -d
+
+# 2. Start RustyDB server (separate terminal)
+cargo run --release --features server -- --server --memory
+
+# 3. Install Python dependencies and run
+pip install -r benches/compare/requirements.txt
+python benches/compare/bench_compare.py
+
+# Filter to specific benchmarks
+python benches/compare/bench_compare.py --filter select
+
+# Export results to CSV
+python benches/compare/bench_compare.py --csv results.csv
+
+# Cleanup
+docker compose -f benches/compare/docker-compose.mysql.yml down
+```
 
 ## Roadmap
 

@@ -1,0 +1,21 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: rustydb-bench-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: bench
+      MYSQL_DATABASE: bench
+    ports:
+      - "3306:3306"
+    tmpfs:
+      - /var/lib/mysql
+    command:
+      - --innodb-flush-log-at-trx-commit=2
+      - --sync-binlog=0
+      - --innodb-buffer-pool-size=256M
+      - --default-authentication-plugin=mysql_native_password
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-pbench"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
