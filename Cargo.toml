@@ -1,0 +1,45 @@
+[package]
+name = "rustydb"
+version = "0.1.0"
+edition = "2024"
+authors = ["Matthew Revill"]
+description = "A high-performance in-memory key-value store with SQL support"
+license = "Apache-2.0"
+
+[dependencies]
+dashmap = "6.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP server for REST API
+tokio = { version = "1.43", features = ["full"], optional = true }
+axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
+base64 = { version = "0.22", optional = true }
+
+# MySQL wire protocol authentication
+sha1 = { version = "0.10", optional = true }
+
+[features]
+default = []
+server = ["tokio", "axum", "tower-http", "base64", "sha1"]
+
+[dev-dependencies]
+# For testing and benchmarking
+criterion = "0.5"
+num_cpus = "1.16"
+tempfile = "3.15"
+tokio = { version = "1.43", features = ["full"] }
+sha1 = "0.10"
+
+[[bench]]
+name = "kv_bench"
+harness = false
+
+[[bench]]
+name = "stress_test_bench"
+harness = false
+
+[[bench]]
+name = "sql_bench"
+harness = false

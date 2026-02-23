@@ -1,0 +1,104 @@
+# RustyDB Docker Compose Configuration
+# 
+# Quick Start:
+#   docker-compose up -d
+#
+# With custom settings:
+#   docker-compose up -d --build
+#
+# View logs:
+#   docker-compose logs -f
+#
+# Stop:
+#   docker-compose down
+#
+# Stop and remove data:
+#   docker-compose down -v
+
+services:
+  rustydb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rustydb:latest
+    container_name: rustydb
+    restart: unless-stopped
+    
+    # =========================================================================
+    # Port Configuration
+    # =========================================================================
+    # Map host port to container port
+    # Format: "HOST_PORT:CONTAINER_PORT"
+    ports:
+      - "${RUSTYDB_PORT:-8080}:8080"
+      - "${RUSTYDB_WIRE_PORT:-3307}:3307"
+    
+    # =========================================================================
+    # Environment Variables
+    # =========================================================================
+    environment:
+      # Server binding (usually leave as 0.0.0.0 inside container)
+      - RUSTYDB_HOST=0.0.0.0
+      
+      # Internal port (matches EXPOSE in Dockerfile)
+      - RUSTYDB_PORT=8080
+
+      # MySQL wire protocol port
+      - RUSTYDB_WIRE_PORT=3307
+      
+      # Authentication (uncomment and set to enable)
+      # Leave empty or unset for no authentication
+      - RUSTYDB_USERNAME=${RUSTYDB_USERNAME:-}
+      - RUSTYDB_PASSWORD=${RUSTYDB_PASSWORD:-}
+      
+      # Data directory inside container
+      - RUSTYDB_DATA_DIR=/data
+      
+      # Storage mode:
+      # - false: Persistent storage (data survives container restart)
+      # - true:  Memory-only mode (faster, data lost on restart)
+      - RUSTYDB_MEMORY_ONLY=${RUSTYDB_MEMORY_ONLY:-false}
+    
+    # =========================================================================
+    # Persistent Storage
+    # =========================================================================
+    # Named volume for data persistence
+    # Remove this section if using RUSTYDB_MEMORY_ONLY=true
+    volumes:
+      - rustydb_data:/data
+    
+    # =========================================================================
+    # Health Check
+    # =========================================================================
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    
+    # =========================================================================
+    # Resource Limits (optional, uncomment to enable)
+    # =========================================================================
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '2'
+    #       memory: 1G
+    #     reservations:
+    #       cpus: '0.5'
+    #       memory: 256M
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  rustydb_data:
+    name: rustydb_data
+
+# =============================================================================
+# Networks (optional, for multi-container setups)
+# =============================================================================
+# networks:
+#   default:
+#     name: rustydb_network
