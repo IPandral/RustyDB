@@ -75,12 +75,18 @@ USER rustydb
 # RUSTYDB_PASSWORD    - Auth password (shared by HTTP and wire protocol)
 # RUSTYDB_DATA_DIR    - Data directory (default: /data)
 # RUSTYDB_MEMORY_ONLY - Use in-memory only mode (default: false)
+# RUSTYDB_PLAN_CACHE_CAPACITY - Parsed/optimized plan LRU entries (default: 256)
+# RUSTYDB_MEMORY_POOL_CAPACITY - Reusable SQL scratch buffers (default: 32)
+# RUSTYDB_BLOOM_FALSE_POSITIVE_RATE - Per-index Bloom target (default: 0.01)
 
 ENV RUSTYDB_HOST=0.0.0.0
 ENV RUSTYDB_PORT=8080
 ENV RUSTYDB_WIRE_PORT=3307
 ENV RUSTYDB_DATA_DIR=/data
 ENV RUSTYDB_MEMORY_ONLY=false
+ENV RUSTYDB_PLAN_CACHE_CAPACITY=256
+ENV RUSTYDB_MEMORY_POOL_CAPACITY=32
+ENV RUSTYDB_BLOOM_FALSE_POSITIVE_RATE=0.01
 
 # Expose default ports (HTTP API + MySQL wire protocol)
 EXPOSE 8080

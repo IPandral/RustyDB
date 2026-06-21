@@ -1,753 +1,805 @@
+use sqlparser::ast as sql;
+use sqlparser::dialect::MySqlDialect;
+use sqlparser::parser::Parser;
+
 use super::types::*;
 
-/// Parsed SQL statement
-#[derive(Debug, Clone)]
+/// Parsed RustyDB statement. The public AST is independent of sqlparser so the
+/// execution and persistence layers are not coupled to a third-party AST.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     CreateTable {
         table_name: String,
         columns: Vec<ColumnDef>,
+        constraints: Vec<TableConstraint>,
         if_not_exists: bool,
     },
     DropTable {
         table_name: String,
         if_exists: bool,
     },
+    CreateIndex {
+        name: String,
+        table_name: String,
+        columns: Vec<String>,
+        unique: bool,
+        if_not_exists: bool,
+    },
+    DropIndex {
+        name: String,
+        table_name: String,
+        if_exists: bool,
+    },
     Insert {
         table_name: String,
         columns: Option<Vec<String>>,
-        values: Vec<Vec<Value>>,
+        values: Vec<Vec<Expr>>,
     },
-    Select {
-        columns: SelectColumns,
-        table_name: String,
-        where_clause: Option<WhereClause>,
-        order_by: Option<OrderBy>,
-        limit: Option<usize>,
-    },
+    Query(Query),
     Update {
         table_name: String,
-        assignments: Vec<(String, Value)>,
-        where_clause: Option<WhereClause>,
+        assignments: Vec<(String, Expr)>,
+        selection: Option<Expr>,
     },
     Delete {
         table_name: String,
-        where_clause: Option<WhereClause>,
+        selection: Option<Expr>,
     },
     ShowTables,
+    ShowIndexes {
+        table_name: String,
+    },
     DescribeTable {
         table_name: String,
     },
+    Explain(Box<Statement>),
+    Begin,
+    Commit,
+    Rollback,
 }
 
-/// SELECT column specification
-#[derive(Debug, Clone)]
-pub enum SelectColumns {
-    All,
-    Columns(Vec<String>),
+/// Compatibility aliases retained for callers that used the original names.
+pub type WhereClause = Expr;
+pub type Condition = Expr;
+pub type SelectColumns = Vec<SelectItem>;
+
+pub fn parse_sql(input: &str) -> Result<Statement, String> {
+    let trimmed = input.trim().trim_end_matches(';').trim();
+    if trimmed.is_empty() {
+        return Err("Empty statement".to_string());
+    }
+
+    if let Some(statement) = parse_rustydb_extension(trimmed)? {
+        return Ok(statement);
+    }
+
+    let mut statements =
+        Parser::parse_sql(&MySqlDialect {}, trimmed).map_err(|error| error.to_string())?;
+    if statements.len() != 1 {
+        return Err("Expected exactly one SQL statement".to_string());
+    }
+    convert_statement(statements.remove(0))
 }
 
-/// WHERE clause representation
-#[derive(Debug, Clone)]
-pub struct WhereClause {
-    pub conditions: Vec<Condition>,
-    pub logical_ops: Vec<LogicalOp>,
-}
+fn parse_rustydb_extension(sql: &str) -> Result<Option<Statement>, String> {
+    let words: Vec<&str> = sql.split_whitespace().collect();
+    if words.len() >= 3
+        && words[0].eq_ignore_ascii_case("SHOW")
+        && (words[1].eq_ignore_ascii_case("INDEX")
+            || words[1].eq_ignore_ascii_case("INDEXES")
+            || words[1].eq_ignore_ascii_case("KEYS"))
+        && (words[2].eq_ignore_ascii_case("FROM") || words[2].eq_ignore_ascii_case("ON"))
+    {
+        let table_name = words
+            .get(3)
+            .ok_or_else(|| "SHOW INDEXES requires a table name".to_string())?;
+        return Ok(Some(Statement::ShowIndexes {
+            table_name: clean_identifier(table_name),
+        }));
+    }
 
-impl WhereClause {
-    pub fn single(condition: Condition) -> Self {
-        WhereClause {
-            conditions: vec![condition],
-            logical_ops: vec![],
+    if words.len() >= 5
+        && words[0].eq_ignore_ascii_case("DROP")
+        && words[1].eq_ignore_ascii_case("INDEX")
+    {
+        let mut offset = 2;
+        let if_exists = words
+            .get(offset)
+            .is_some_and(|word| word.eq_ignore_ascii_case("IF"))
+            && words
+                .get(offset + 1)
+                .is_some_and(|word| word.eq_ignore_ascii_case("EXISTS"));
+        if if_exists {
+            offset += 2;
         }
-    }
-
-    pub fn and(mut self, condition: Condition) -> Self {
-        self.conditions.push(condition);
-        self.logical_ops.push(LogicalOp::And);
-        self
-    }
-
-    pub fn or(mut self, condition: Condition) -> Self {
-        self.conditions.push(condition);
-        self.logical_ops.push(LogicalOp::Or);
-        self
-    }
-}
-
-/// A single condition in a WHERE clause
-#[derive(Debug, Clone)]
-pub struct Condition {
-    pub column: String,
-    pub op: ComparisonOp,
-    pub value: Value,
-}
-
-/// ORDER BY specification
-#[derive(Debug, Clone)]
-pub struct OrderBy {
-    pub column: String,
-    pub descending: bool,
-}
-
-/// SQL Parser
-pub struct Parser {
-    tokens: Vec<Token>,
-    position: usize,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum Token {
-    // Keywords
-    Create,
-    Table,
-    Drop,
-    Insert,
-    Into,
-    Values,
-    Select,
-    From,
-    Where,
-    Update,
-    Set,
-    Delete,
-    And,
-    Or,
-    Not,
-    Null,
-    Primary,
-    Key,
-    If,
-    Exists,
-    Show,
-    Tables,
-    Describe,
-    Desc,
-    Order,
-    By,
-    Asc,
-    Limit,
-    Like,
-    // Types
-    IntegerType,
-    FloatType,
-    TextType,
-    VarcharType,
-    BooleanType,
-    // Symbols
-    LeftParen,
-    RightParen,
-    Comma,
-    Semicolon,
-    Star,
-    Equals,
-    NotEquals,
-    LessThan,
-    LessThanOrEqual,
-    GreaterThan,
-    GreaterThanOrEqual,
-    // Literals
-    Identifier(String),
-    StringLiteral(String),
-    IntegerLiteral(i64),
-    FloatLiteral(f64),
-    True,
-    False,
-}
-
-impl Parser {
-    pub fn new(sql: &str) -> Self {
-        let tokens = Self::tokenize(sql);
-        Parser { tokens, position: 0 }
-    }
-
-    /// Parse a SQL statement
-    pub fn parse(&mut self) -> Result<Statement, String> {
-        self.position = 0;
-        
-        let stmt = match self.peek() {
-            Some(Token::Create) => self.parse_create(),
-            Some(Token::Drop) => self.parse_drop(),
-            Some(Token::Insert) => self.parse_insert(),
-            Some(Token::Select) => self.parse_select(),
-            Some(Token::Update) => self.parse_update(),
-            Some(Token::Delete) => self.parse_delete(),
-            Some(Token::Show) => self.parse_show(),
-            Some(Token::Describe) | Some(Token::Desc) => self.parse_describe(),
-            Some(token) => Err(format!("Unexpected token: {:?}", token)),
-            None => Err("Empty statement".to_string()),
-        }?;
-
-        // Optional semicolon at end
-        if self.peek() == Some(&Token::Semicolon) {
-            self.advance();
+        let name = words
+            .get(offset)
+            .ok_or_else(|| "DROP INDEX requires an index name".to_string())?;
+        if !words
+            .get(offset + 1)
+            .is_some_and(|word| word.eq_ignore_ascii_case("ON"))
+        {
+            return Ok(None);
         }
-
-        Ok(stmt)
-    }
-
-    fn tokenize(sql: &str) -> Vec<Token> {
-        let mut tokens = Vec::new();
-        let mut chars = sql.chars().peekable();
-
-        while let Some(&c) = chars.peek() {
-            match c {
-                // Whitespace
-                ' ' | '\t' | '\n' | '\r' => {
-                    chars.next();
-                }
-                // Symbols
-                '(' => {
-                    tokens.push(Token::LeftParen);
-                    chars.next();
-                }
-                ')' => {
-                    tokens.push(Token::RightParen);
-                    chars.next();
-                }
-                ',' => {
-                    tokens.push(Token::Comma);
-                    chars.next();
-                }
-                ';' => {
-                    tokens.push(Token::Semicolon);
-                    chars.next();
-                }
-                '*' => {
-                    tokens.push(Token::Star);
-                    chars.next();
-                }
-                '=' => {
-                    tokens.push(Token::Equals);
-                    chars.next();
-                }
-                '<' => {
-                    chars.next();
-                    if chars.peek() == Some(&'=') {
-                        chars.next();
-                        tokens.push(Token::LessThanOrEqual);
-                    } else if chars.peek() == Some(&'>') {
-                        chars.next();
-                        tokens.push(Token::NotEquals);
-                    } else {
-                        tokens.push(Token::LessThan);
-                    }
-                }
-                '>' => {
-                    chars.next();
-                    if chars.peek() == Some(&'=') {
-                        chars.next();
-                        tokens.push(Token::GreaterThanOrEqual);
-                    } else {
-                        tokens.push(Token::GreaterThan);
-                    }
-                }
-                '!' => {
-                    chars.next();
-                    if chars.peek() == Some(&'=') {
-                        chars.next();
-                        tokens.push(Token::NotEquals);
-                    }
-                }
-                // String literal
-                '\'' | '"' => {
-                    let quote = chars.next().unwrap();
-                    let mut string = String::new();
-                    while let Some(&c) = chars.peek() {
-                        if c == quote {
-                            chars.next();
-                            break;
-                        }
-                        // Handle escape sequences
-                        if c == '\\' {
-                            chars.next();
-                            if let Some(&escaped) = chars.peek() {
-                                string.push(match escaped {
-                                    'n' => '\n',
-                                    't' => '\t',
-                                    'r' => '\r',
-                                    _ => escaped,
-                                });
-                                chars.next();
-                            }
-                        } else {
-                            string.push(chars.next().unwrap());
-                        }
-                    }
-                    tokens.push(Token::StringLiteral(string));
-                }
-                // Number
-                '0'..='9' | '-' => {
-                    let mut num_str = String::new();
-                    if c == '-' {
-                        num_str.push(chars.next().unwrap());
-                    }
-                    while let Some(&c) = chars.peek() {
-                        if c.is_ascii_digit() || c == '.' {
-                            num_str.push(chars.next().unwrap());
-                        } else {
-                            break;
-                        }
-                    }
-                    if num_str == "-" {
-                        // Just a minus sign, not a number
-                        continue;
-                    }
-                    if num_str.contains('.') {
-                        if let Ok(f) = num_str.parse::<f64>() {
-                            tokens.push(Token::FloatLiteral(f));
-                        }
-                    } else if let Ok(i) = num_str.parse::<i64>() {
-                        tokens.push(Token::IntegerLiteral(i));
-                    }
-                }
-                // Identifier or keyword
-                'a'..='z' | 'A'..='Z' | '_' => {
-                    let mut ident = String::new();
-                    while let Some(&c) = chars.peek() {
-                        if c.is_alphanumeric() || c == '_' {
-                            ident.push(chars.next().unwrap());
-                        } else {
-                            break;
-                        }
-                    }
-                    let token = match ident.to_uppercase().as_str() {
-                        "CREATE" => Token::Create,
-                        "TABLE" => Token::Table,
-                        "DROP" => Token::Drop,
-                        "INSERT" => Token::Insert,
-                        "INTO" => Token::Into,
-                        "VALUES" => Token::Values,
-                        "SELECT" => Token::Select,
-                        "FROM" => Token::From,
-                        "WHERE" => Token::Where,
-                        "UPDATE" => Token::Update,
-                        "SET" => Token::Set,
-                        "DELETE" => Token::Delete,
-                        "AND" => Token::And,
-                        "OR" => Token::Or,
-                        "NOT" => Token::Not,
-                        "NULL" => Token::Null,
-                        "PRIMARY" => Token::Primary,
-                        "KEY" => Token::Key,
-                        "IF" => Token::If,
-                        "EXISTS" => Token::Exists,
-                        "SHOW" => Token::Show,
-                        "TABLES" => Token::Tables,
-                        "DESCRIBE" => Token::Describe,
-                        "DESC" => Token::Desc,
-                        "ORDER" => Token::Order,
-                        "BY" => Token::By,
-                        "ASC" => Token::Asc,
-                        "LIMIT" => Token::Limit,
-                        "LIKE" => Token::Like,
-                        "INTEGER" | "INT" | "BIGINT" => Token::IntegerType,
-                        "FLOAT" | "DOUBLE" | "REAL" | "DECIMAL" => Token::FloatType,
-                        "TEXT" | "STRING" | "CHAR" => Token::TextType,
-                        "VARCHAR" => Token::VarcharType,
-                        "BOOLEAN" | "BOOL" => Token::BooleanType,
-                        "TRUE" => Token::True,
-                        "FALSE" => Token::False,
-                        _ => Token::Identifier(ident),
-                    };
-                    tokens.push(token);
-                }
-                _ => {
-                    chars.next(); // Skip unknown characters
-                }
-            }
-        }
-
-        tokens
-    }
-
-    fn peek(&self) -> Option<&Token> {
-        self.tokens.get(self.position)
-    }
-
-    fn advance(&mut self) -> Option<&Token> {
-        let token = self.tokens.get(self.position);
-        self.position += 1;
-        token
-    }
-
-    fn expect(&mut self, expected: Token) -> Result<(), String> {
-        match self.advance() {
-            Some(token) if *token == expected => Ok(()),
-            Some(token) => Err(format!("Expected {:?}, got {:?}", expected, token)),
-            None => Err(format!("Expected {:?}, got end of input", expected)),
-        }
-    }
-
-    fn parse_identifier(&mut self) -> Result<String, String> {
-        match self.advance() {
-            Some(Token::Identifier(name)) => Ok(name.clone()),
-            Some(token) => Err(format!("Expected identifier, got {:?}", token)),
-            None => Err("Expected identifier, got end of input".to_string()),
-        }
-    }
-
-    fn parse_create(&mut self) -> Result<Statement, String> {
-        self.expect(Token::Create)?;
-        self.expect(Token::Table)?;
-
-        let if_not_exists = if self.peek() == Some(&Token::If) {
-            self.advance();
-            self.expect(Token::Not)?;
-            self.expect(Token::Exists)?;
-            true
-        } else {
-            false
-        };
-
-        let table_name = self.parse_identifier()?;
-        self.expect(Token::LeftParen)?;
-
-        let mut columns = Vec::new();
-        loop {
-            let col_name = self.parse_identifier()?;
-            let data_type = self.parse_data_type()?;
-            
-            let mut col_def = ColumnDef::new(&col_name, data_type);
-
-            // Parse column constraints
-            loop {
-                match self.peek() {
-                    Some(Token::Primary) => {
-                        self.advance();
-                        self.expect(Token::Key)?;
-                        col_def = col_def.primary_key();
-                    }
-                    Some(Token::Not) => {
-                        self.advance();
-                        self.expect(Token::Null)?;
-                        col_def = col_def.not_null();
-                    }
-                    _ => break,
-                }
-            }
-
-            columns.push(col_def);
-
-            match self.peek() {
-                Some(Token::Comma) => {
-                    self.advance();
-                }
-                Some(Token::RightParen) => break,
-                _ => return Err("Expected ',' or ')' in column list".to_string()),
-            }
-        }
-
-        self.expect(Token::RightParen)?;
-
-        Ok(Statement::CreateTable {
-            table_name,
-            columns,
-            if_not_exists,
-        })
-    }
-
-    fn parse_data_type(&mut self) -> Result<DataType, String> {
-        match self.advance() {
-            Some(Token::IntegerType) => Ok(DataType::Integer),
-            Some(Token::FloatType) => Ok(DataType::Float),
-            Some(Token::TextType) => Ok(DataType::Text),
-            Some(Token::VarcharType) => {
-                // VARCHAR(n) - we ignore the size for now
-                if self.peek() == Some(&Token::LeftParen) {
-                    self.advance();
-                    // Skip the size
-                    self.advance();
-                    self.expect(Token::RightParen)?;
-                }
-                Ok(DataType::Text)
-            }
-            Some(Token::BooleanType) => Ok(DataType::Boolean),
-            Some(token) => Err(format!("Expected data type, got {:?}", token)),
-            None => Err("Expected data type, got end of input".to_string()),
-        }
-    }
-
-    fn parse_drop(&mut self) -> Result<Statement, String> {
-        self.expect(Token::Drop)?;
-        self.expect(Token::Table)?;
-
-        let if_exists = if self.peek() == Some(&Token::If) {
-            self.advance();
-            self.expect(Token::Exists)?;
-            true
-        } else {
-            false
-        };
-
-        let table_name = self.parse_identifier()?;
-
-        Ok(Statement::DropTable {
-            table_name,
+        let table_name = words
+            .get(offset + 2)
+            .ok_or_else(|| "DROP INDEX requires ON <table>".to_string())?;
+        return Ok(Some(Statement::DropIndex {
+            name: clean_identifier(name),
+            table_name: clean_identifier(table_name),
             if_exists,
-        })
+        }));
     }
+    Ok(None)
+}
 
-    fn parse_insert(&mut self) -> Result<Statement, String> {
-        self.expect(Token::Insert)?;
-        self.expect(Token::Into)?;
+fn clean_identifier(value: &str) -> String {
+    value
+        .trim_matches(|character| matches!(character, '`' | '"' | '\'' | ';'))
+        .to_ascii_lowercase()
+}
 
-        let table_name = self.parse_identifier()?;
+fn object_name(name: &sql::ObjectName) -> String {
+    name.0
+        .last()
+        .map(|identifier| identifier.value.to_ascii_lowercase())
+        .unwrap_or_default()
+}
 
-        // Optional column list
-        let columns = if self.peek() == Some(&Token::LeftParen) {
-            self.advance();
-            let mut cols = Vec::new();
-            loop {
-                cols.push(self.parse_identifier()?);
-                match self.peek() {
-                    Some(Token::Comma) => {
-                        self.advance();
-                    }
-                    Some(Token::RightParen) => {
-                        self.advance();
-                        break;
-                    }
-                    _ => return Err("Expected ',' or ')' in column list".to_string()),
-                }
+fn convert_statement(statement: sql::Statement) -> Result<Statement, String> {
+    match statement {
+        sql::Statement::CreateTable(create) => convert_create_table(create),
+        sql::Statement::CreateIndex(create) => {
+            if create.using.is_some() || create.predicate.is_some() || !create.include.is_empty() {
+                return Err("Partial, covering, and non-B-tree indexes are unsupported".to_string());
             }
-            Some(cols)
-        } else {
-            None
-        };
-
-        self.expect(Token::Values)?;
-
-        // Parse value lists
-        let mut values = Vec::new();
-        loop {
-            self.expect(Token::LeftParen)?;
-            let mut row_values = Vec::new();
-            loop {
-                row_values.push(self.parse_value()?);
-                match self.peek() {
-                    Some(Token::Comma) => {
-                        self.advance();
-                    }
-                    Some(Token::RightParen) => {
-                        self.advance();
-                        break;
-                    }
-                    _ => return Err("Expected ',' or ')' in value list".to_string()),
-                }
-            }
-            values.push(row_values);
-
-            // Check for more value sets
-            if self.peek() == Some(&Token::Comma) {
-                self.advance();
-            } else {
-                break;
-            }
+            let name = create
+                .name
+                .as_ref()
+                .map(object_name)
+                .ok_or_else(|| "CREATE INDEX requires an index name".to_string())?;
+            let columns = create
+                .columns
+                .into_iter()
+                .map(|column| match column.expr {
+                    sql::Expr::Identifier(identifier) => Ok(identifier.value.to_ascii_lowercase()),
+                    _ => Err("Index expressions are unsupported".to_string()),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Statement::CreateIndex {
+                name,
+                table_name: object_name(&create.table_name),
+                columns,
+                unique: create.unique,
+                if_not_exists: create.if_not_exists,
+            })
         }
-
-        Ok(Statement::Insert {
-            table_name,
-            columns,
-            values,
-        })
-    }
-
-    fn parse_value(&mut self) -> Result<Value, String> {
-        match self.advance() {
-            Some(Token::IntegerLiteral(i)) => Ok(Value::Integer(*i)),
-            Some(Token::FloatLiteral(f)) => Ok(Value::Float(*f)),
-            Some(Token::StringLiteral(s)) => Ok(Value::Text(s.clone())),
-            Some(Token::True) => Ok(Value::Boolean(true)),
-            Some(Token::False) => Ok(Value::Boolean(false)),
-            Some(Token::Null) => Ok(Value::Null),
-            Some(token) => Err(format!("Expected value, got {:?}", token)),
-            None => Err("Expected value, got end of input".to_string()),
-        }
-    }
-
-    fn parse_select(&mut self) -> Result<Statement, String> {
-        self.expect(Token::Select)?;
-
-        // Parse columns
-        let columns = if self.peek() == Some(&Token::Star) {
-            self.advance();
-            SelectColumns::All
-        } else {
-            let mut cols = Vec::new();
-            loop {
-                cols.push(self.parse_identifier()?);
-                if self.peek() == Some(&Token::Comma) {
-                    self.advance();
-                } else {
-                    break;
-                }
+        sql::Statement::Drop {
+            object_type,
+            if_exists,
+            names,
+            ..
+        } => {
+            if object_type != sql::ObjectType::Table || names.len() != 1 {
+                return Err("Only DROP TABLE is supported by this form".to_string());
             }
-            SelectColumns::Columns(cols)
-        };
-
-        self.expect(Token::From)?;
-        let table_name = self.parse_identifier()?;
-
-        // Optional WHERE clause
-        let where_clause = if self.peek() == Some(&Token::Where) {
-            self.advance();
-            Some(self.parse_where_clause()?)
-        } else {
-            None
-        };
-
-        // Optional ORDER BY
-        let order_by = if self.peek() == Some(&Token::Order) {
-            self.advance();
-            self.expect(Token::By)?;
-            let column = self.parse_identifier()?;
-            let descending = if self.peek() == Some(&Token::Desc) {
-                self.advance();
-                true
-            } else {
-                if self.peek() == Some(&Token::Asc) {
-                    self.advance();
-                }
-                false
-            };
-            Some(OrderBy { column, descending })
-        } else {
-            None
-        };
-
-        // Optional LIMIT
-        let limit = if self.peek() == Some(&Token::Limit) {
-            self.advance();
-            match self.advance() {
-                Some(Token::IntegerLiteral(n)) => Some(*n as usize),
-                _ => return Err("Expected integer after LIMIT".to_string()),
-            }
-        } else {
-            None
-        };
-
-        Ok(Statement::Select {
-            columns,
-            table_name,
-            where_clause,
-            order_by,
-            limit,
-        })
-    }
-
-    fn parse_where_clause(&mut self) -> Result<WhereClause, String> {
-        let first_condition = self.parse_condition()?;
-        let mut where_clause = WhereClause::single(first_condition);
-
-        loop {
-            match self.peek() {
-                Some(Token::And) => {
-                    self.advance();
-                    let condition = self.parse_condition()?;
-                    where_clause = where_clause.and(condition);
-                }
-                Some(Token::Or) => {
-                    self.advance();
-                    let condition = self.parse_condition()?;
-                    where_clause = where_clause.or(condition);
-                }
-                _ => break,
-            }
+            Ok(Statement::DropTable {
+                table_name: object_name(&names[0]),
+                if_exists,
+            })
         }
-
-        Ok(where_clause)
-    }
-
-    fn parse_condition(&mut self) -> Result<Condition, String> {
-        let column = self.parse_identifier()?;
-        let op = self.parse_comparison_op()?;
-        let value = self.parse_value()?;
-
-        Ok(Condition { column, op, value })
-    }
-
-    fn parse_comparison_op(&mut self) -> Result<ComparisonOp, String> {
-        match self.advance() {
-            Some(Token::Equals) => Ok(ComparisonOp::Equal),
-            Some(Token::NotEquals) => Ok(ComparisonOp::NotEqual),
-            Some(Token::LessThan) => Ok(ComparisonOp::LessThan),
-            Some(Token::LessThanOrEqual) => Ok(ComparisonOp::LessThanOrEqual),
-            Some(Token::GreaterThan) => Ok(ComparisonOp::GreaterThan),
-            Some(Token::GreaterThanOrEqual) => Ok(ComparisonOp::GreaterThanOrEqual),
-            Some(Token::Like) => Ok(ComparisonOp::Like),
-            Some(token) => Err(format!("Expected comparison operator, got {:?}", token)),
-            None => Err("Expected comparison operator, got end of input".to_string()),
-        }
-    }
-
-    fn parse_update(&mut self) -> Result<Statement, String> {
-        self.expect(Token::Update)?;
-        let table_name = self.parse_identifier()?;
-        self.expect(Token::Set)?;
-
-        let mut assignments = Vec::new();
-        loop {
-            let column = self.parse_identifier()?;
-            self.expect(Token::Equals)?;
-            let value = self.parse_value()?;
-            assignments.push((column, value));
-
-            if self.peek() == Some(&Token::Comma) {
-                self.advance();
-            } else {
-                break;
-            }
-        }
-
-        let where_clause = if self.peek() == Some(&Token::Where) {
-            self.advance();
-            Some(self.parse_where_clause()?)
-        } else {
-            None
-        };
-
-        Ok(Statement::Update {
-            table_name,
+        sql::Statement::Insert(insert) => convert_insert(insert),
+        sql::Statement::Query(query) => Ok(Statement::Query(convert_query(*query)?)),
+        sql::Statement::Update {
+            table,
             assignments,
-            where_clause,
-        })
-    }
-
-    fn parse_delete(&mut self) -> Result<Statement, String> {
-        self.expect(Token::Delete)?;
-        self.expect(Token::From)?;
-        let table_name = self.parse_identifier()?;
-
-        let where_clause = if self.peek() == Some(&Token::Where) {
-            self.advance();
-            Some(self.parse_where_clause()?)
-        } else {
-            None
-        };
-
-        Ok(Statement::Delete {
-            table_name,
-            where_clause,
-        })
-    }
-
-    fn parse_show(&mut self) -> Result<Statement, String> {
-        self.expect(Token::Show)?;
-        self.expect(Token::Tables)?;
-        Ok(Statement::ShowTables)
-    }
-
-    fn parse_describe(&mut self) -> Result<Statement, String> {
-        self.advance(); // DESCRIBE or DESC
-        let table_name = self.parse_identifier()?;
-        Ok(Statement::DescribeTable { table_name })
+            selection,
+            ..
+        } => {
+            if !table.joins.is_empty() {
+                return Err("UPDATE with JOIN is unsupported".to_string());
+            }
+            let table_name = table_factor_name(&table.relation)?;
+            let assignments = assignments
+                .into_iter()
+                .map(|assignment| {
+                    let name = match assignment.target {
+                        sql::AssignmentTarget::ColumnName(name) => object_name(&name),
+                        sql::AssignmentTarget::Tuple(_) => {
+                            return Err("Tuple assignment is unsupported".to_string());
+                        }
+                    };
+                    Ok((name, convert_expr(assignment.value)?))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(Statement::Update {
+                table_name,
+                assignments,
+                selection: selection.map(convert_expr).transpose()?,
+            })
+        }
+        sql::Statement::Delete(delete) => {
+            let tables = match delete.from {
+                sql::FromTable::WithFromKeyword(tables)
+                | sql::FromTable::WithoutKeyword(tables) => tables,
+            };
+            if tables.len() != 1 || !tables[0].joins.is_empty() {
+                return Err("Only single-table DELETE is supported".to_string());
+            }
+            Ok(Statement::Delete {
+                table_name: table_factor_name(&tables[0].relation)?,
+                selection: delete.selection.map(convert_expr).transpose()?,
+            })
+        }
+        sql::Statement::ShowTables { .. } => Ok(Statement::ShowTables),
+        sql::Statement::ExplainTable { table_name, .. } => Ok(Statement::DescribeTable {
+            table_name: object_name(&table_name),
+        }),
+        sql::Statement::Explain { statement, .. } => {
+            Ok(Statement::Explain(Box::new(convert_statement(*statement)?)))
+        }
+        sql::Statement::StartTransaction { .. } => Ok(Statement::Begin),
+        sql::Statement::Commit { .. } => Ok(Statement::Commit),
+        sql::Statement::Rollback {
+            savepoint: None, ..
+        } => Ok(Statement::Rollback),
+        other => Err(format!("Unsupported SQL statement: {other}")),
     }
 }
 
-/// Convenience function to parse SQL
-pub fn parse_sql(sql: &str) -> Result<Statement, String> {
-    let mut parser = Parser::new(sql);
-    parser.parse()
+fn convert_create_table(create: sql::CreateTable) -> Result<Statement, String> {
+    if create.query.is_some() || create.like.is_some() || create.clone.is_some() {
+        return Err("CREATE TABLE AS/LIKE/CLONE is unsupported".to_string());
+    }
+    let table_name = object_name(&create.name);
+    let mut columns = Vec::with_capacity(create.columns.len());
+    let mut constraints = Vec::new();
+
+    for column in create.columns {
+        let mut converted = ColumnDef::new(
+            &column.name.value.to_ascii_lowercase(),
+            convert_data_type(&column.data_type)?,
+        );
+        for option in column.options {
+            let constraint_name = option.name.map(|name| name.value.to_ascii_lowercase());
+            match option.option {
+                sql::ColumnOption::Null => converted.nullable = true,
+                sql::ColumnOption::NotNull => converted.nullable = false,
+                sql::ColumnOption::Default(expr) => {
+                    converted.default = Some(literal_value(expr)?);
+                }
+                sql::ColumnOption::Unique { is_primary, .. } => {
+                    if is_primary {
+                        converted = converted.primary_key();
+                    } else {
+                        converted = converted.unique();
+                    }
+                }
+                sql::ColumnOption::Check(expr) => {
+                    let expr = convert_expr(expr)?;
+                    converted.checks.push(expr.clone());
+                    constraints.push(TableConstraint::Check {
+                        name: constraint_name,
+                        expr,
+                    });
+                }
+                sql::ColumnOption::ForeignKey {
+                    foreign_table,
+                    referred_columns,
+                    on_delete,
+                    on_update,
+                    ..
+                } => {
+                    validate_referential_actions(on_delete, on_update)?;
+                    constraints.push(TableConstraint::ForeignKey(ForeignKeyConstraint {
+                        name: constraint_name,
+                        columns: vec![converted.name.clone()],
+                        foreign_table: object_name(&foreign_table),
+                        referred_columns: referred_columns
+                            .into_iter()
+                            .map(|column| column.value.to_ascii_lowercase())
+                            .collect(),
+                    }));
+                }
+                unsupported => {
+                    return Err(format!("Unsupported column option: {unsupported}"));
+                }
+            }
+        }
+        columns.push(converted);
+    }
+
+    for constraint in create.constraints {
+        constraints.push(convert_table_constraint(constraint)?);
+    }
+
+    // Normalize column-level primary and unique declarations into table constraints.
+    for column in &columns {
+        if column.primary_key {
+            constraints.push(TableConstraint::PrimaryKey {
+                name: None,
+                columns: vec![column.name.clone()],
+            });
+        } else if column.unique {
+            constraints.push(TableConstraint::Unique {
+                name: None,
+                columns: vec![column.name.clone()],
+            });
+        }
+    }
+
+    Ok(Statement::CreateTable {
+        table_name,
+        columns,
+        constraints,
+        if_not_exists: create.if_not_exists,
+    })
+}
+
+fn convert_table_constraint(constraint: sql::TableConstraint) -> Result<TableConstraint, String> {
+    match constraint {
+        sql::TableConstraint::PrimaryKey { name, columns, .. } => Ok(TableConstraint::PrimaryKey {
+            name: name.map(|name| name.value.to_ascii_lowercase()),
+            columns: columns
+                .into_iter()
+                .map(|column| column.value.to_ascii_lowercase())
+                .collect(),
+        }),
+        sql::TableConstraint::Unique { name, columns, .. } => Ok(TableConstraint::Unique {
+            name: name.map(|name| name.value.to_ascii_lowercase()),
+            columns: columns
+                .into_iter()
+                .map(|column| column.value.to_ascii_lowercase())
+                .collect(),
+        }),
+        sql::TableConstraint::Check { name, expr } => Ok(TableConstraint::Check {
+            name: name.map(|name| name.value.to_ascii_lowercase()),
+            expr: convert_expr(*expr)?,
+        }),
+        sql::TableConstraint::ForeignKey {
+            name,
+            columns,
+            foreign_table,
+            referred_columns,
+            on_delete,
+            on_update,
+            ..
+        } => {
+            validate_referential_actions(on_delete, on_update)?;
+            Ok(TableConstraint::ForeignKey(ForeignKeyConstraint {
+                name: name.map(|name| name.value.to_ascii_lowercase()),
+                columns: columns
+                    .into_iter()
+                    .map(|column| column.value.to_ascii_lowercase())
+                    .collect(),
+                foreign_table: object_name(&foreign_table),
+                referred_columns: referred_columns
+                    .into_iter()
+                    .map(|column| column.value.to_ascii_lowercase())
+                    .collect(),
+            }))
+        }
+        sql::TableConstraint::Index { .. } => Err(
+            "Inline INDEX declarations are unsupported; use CREATE INDEX after CREATE TABLE"
+                .to_string(),
+        ),
+        other => Err(format!("Unsupported table constraint: {other}")),
+    }
+}
+
+fn validate_referential_actions(
+    on_delete: Option<sql::ReferentialAction>,
+    on_update: Option<sql::ReferentialAction>,
+) -> Result<(), String> {
+    for action in [on_delete, on_update].into_iter().flatten() {
+        if !matches!(
+            action,
+            sql::ReferentialAction::Restrict | sql::ReferentialAction::NoAction
+        ) {
+            return Err("Only RESTRICT/NO ACTION foreign keys are supported".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn convert_insert(insert: sql::Insert) -> Result<Statement, String> {
+    if insert.on.is_some() || insert.ignore || insert.replace_into {
+        return Err("INSERT conflict/replace clauses are unsupported".to_string());
+    }
+    let source = insert
+        .source
+        .ok_or_else(|| "INSERT requires VALUES".to_string())?;
+    let rows = match *source.body {
+        sql::SetExpr::Values(values) => values.rows,
+        _ => return Err("INSERT ... SELECT is unsupported".to_string()),
+    };
+    Ok(Statement::Insert {
+        table_name: object_name(&insert.table_name),
+        columns: if insert.columns.is_empty() {
+            None
+        } else {
+            Some(
+                insert
+                    .columns
+                    .into_iter()
+                    .map(|column| column.value.to_ascii_lowercase())
+                    .collect(),
+            )
+        },
+        values: rows
+            .into_iter()
+            .map(|row| row.into_iter().map(convert_expr).collect())
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn convert_query(query: sql::Query) -> Result<Query, String> {
+    if query.offset.is_some() || query.fetch.is_some() || !query.limit_by.is_empty() {
+        return Err("OFFSET/FETCH/LIMIT BY are unsupported".to_string());
+    }
+    let ctes = if let Some(with) = query.with {
+        if with.recursive {
+            return Err("Recursive CTEs are unsupported".to_string());
+        }
+        with.cte_tables
+            .into_iter()
+            .map(|cte| {
+                Ok(Cte {
+                    name: cte.alias.name.value.to_ascii_lowercase(),
+                    columns: cte
+                        .alias
+                        .columns
+                        .into_iter()
+                        .map(|column| column.name.value.to_ascii_lowercase())
+                        .collect(),
+                    query: Box::new(convert_query(*cte.query)?),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    } else {
+        Vec::new()
+    };
+
+    let select = match *query.body {
+        sql::SetExpr::Select(select) => *select,
+        sql::SetExpr::Query(query) => return convert_query(*query),
+        _ => return Err("Set operations are unsupported".to_string()),
+    };
+    if select.from.len() > 1 {
+        return Err("Comma joins are unsupported; use explicit JOIN syntax".to_string());
+    }
+    let (from, joins) = if let Some(table) = select.from.into_iter().next() {
+        let from = Some(convert_table_source(table.relation)?);
+        let joins = table
+            .joins
+            .into_iter()
+            .map(convert_join)
+            .collect::<Result<Vec<_>, _>>()?;
+        (from, joins)
+    } else {
+        (None, Vec::new())
+    };
+    let group_by = match select.group_by {
+        sql::GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => {
+            expressions
+                .into_iter()
+                .map(convert_expr)
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        sql::GroupByExpr::Expressions(_, _) | sql::GroupByExpr::All(_) => {
+            return Err("GROUP BY modifiers/ALL are unsupported".to_string());
+        }
+    };
+    let order_by = query
+        .order_by
+        .map(|order| {
+            order
+                .exprs
+                .into_iter()
+                .map(|item| {
+                    Ok(OrderBy {
+                        expr: convert_expr(item.expr)?,
+                        descending: item.asc == Some(false),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let limit = query.limit.map(literal_usize).transpose()?;
+
+    Ok(Query {
+        ctes,
+        distinct: select.distinct.is_some(),
+        projection: select
+            .projection
+            .into_iter()
+            .map(convert_select_item)
+            .collect::<Result<Vec<_>, _>>()?,
+        from,
+        joins,
+        selection: select.selection.map(convert_expr).transpose()?,
+        group_by,
+        having: select.having.map(convert_expr).transpose()?,
+        order_by,
+        limit,
+    })
+}
+
+fn convert_select_item(item: sql::SelectItem) -> Result<SelectItem, String> {
+    match item {
+        sql::SelectItem::Wildcard(options) if options == Default::default() => {
+            Ok(SelectItem::Wildcard(None))
+        }
+        sql::SelectItem::QualifiedWildcard(name, options) if options == Default::default() => {
+            Ok(SelectItem::Wildcard(Some(object_name(&name))))
+        }
+        sql::SelectItem::UnnamedExpr(expr) => Ok(SelectItem::Expr {
+            expr: convert_expr(expr)?,
+            alias: None,
+        }),
+        sql::SelectItem::ExprWithAlias { expr, alias } => Ok(SelectItem::Expr {
+            expr: convert_expr(expr)?,
+            alias: Some(alias.value.to_ascii_lowercase()),
+        }),
+        _ => Err("Wildcard modifiers are unsupported".to_string()),
+    }
+}
+
+fn convert_table_source(source: sql::TableFactor) -> Result<TableSource, String> {
+    match source {
+        sql::TableFactor::Table {
+            name, alias, args, ..
+        } if args.is_none() => Ok(TableSource::Table {
+            name: object_name(&name),
+            alias: alias.map(|alias| alias.name.value.to_ascii_lowercase()),
+        }),
+        sql::TableFactor::Derived {
+            lateral: false,
+            subquery,
+            alias: Some(alias),
+        } => Ok(TableSource::Derived {
+            query: Box::new(convert_query(*subquery)?),
+            alias: alias.name.value.to_ascii_lowercase(),
+        }),
+        sql::TableFactor::Derived { lateral: true, .. } => {
+            Err("LATERAL subqueries are unsupported".to_string())
+        }
+        sql::TableFactor::Derived { alias: None, .. } => {
+            Err("Derived tables require an alias".to_string())
+        }
+        _ => Err("Unsupported table source".to_string()),
+    }
+}
+
+fn table_factor_name(source: &sql::TableFactor) -> Result<String, String> {
+    match source {
+        sql::TableFactor::Table { name, args, .. } if args.is_none() => Ok(object_name(name)),
+        _ => Err("Expected a table name".to_string()),
+    }
+}
+
+fn convert_join(join: sql::Join) -> Result<Join, String> {
+    let (join_type, constraint) = match join.join_operator {
+        sql::JoinOperator::Inner(constraint) => (JoinType::Inner, Some(constraint)),
+        sql::JoinOperator::LeftOuter(constraint) => (JoinType::Left, Some(constraint)),
+        sql::JoinOperator::RightOuter(constraint) => (JoinType::Right, Some(constraint)),
+        sql::JoinOperator::CrossJoin => (JoinType::Cross, None),
+        sql::JoinOperator::FullOuter(_) => return Err("FULL JOIN is unsupported".to_string()),
+        _ => return Err("Unsupported JOIN type".to_string()),
+    };
+    let on = match constraint {
+        None | Some(sql::JoinConstraint::None) => None,
+        Some(sql::JoinConstraint::On(expr)) => Some(convert_expr(expr)?),
+        Some(sql::JoinConstraint::Using(_)) | Some(sql::JoinConstraint::Natural) => {
+            return Err("NATURAL/USING joins are unsupported; use ON".to_string());
+        }
+    };
+    Ok(Join {
+        join_type,
+        source: convert_table_source(join.relation)?,
+        on,
+    })
+}
+
+fn convert_expr(expr: sql::Expr) -> Result<Expr, String> {
+    match expr {
+        sql::Expr::Identifier(identifier) => Ok(Expr::Column {
+            qualifier: None,
+            name: identifier.value.to_ascii_lowercase(),
+        }),
+        sql::Expr::CompoundIdentifier(identifiers) if identifiers.len() == 2 => Ok(Expr::Column {
+            qualifier: Some(identifiers[0].value.to_ascii_lowercase()),
+            name: identifiers[1].value.to_ascii_lowercase(),
+        }),
+        sql::Expr::Value(value) => Ok(Expr::Literal(convert_value(value)?)),
+        sql::Expr::Nested(expr) => convert_expr(*expr),
+        sql::Expr::BinaryOp { left, op, right } => Ok(Expr::Binary {
+            left: Box::new(convert_expr(*left)?),
+            op: convert_binary_op(op)?,
+            right: Box::new(convert_expr(*right)?),
+        }),
+        sql::Expr::UnaryOp { op, expr } => Ok(Expr::Unary {
+            op: match op {
+                sql::UnaryOperator::Not => UnaryOp::Not,
+                sql::UnaryOperator::Minus => UnaryOp::Negate,
+                sql::UnaryOperator::Plus => UnaryOp::Plus,
+                _ => return Err(format!("Unsupported unary operator: {op}")),
+            },
+            expr: Box::new(convert_expr(*expr)?),
+        }),
+        sql::Expr::IsNull(expr) => Ok(Expr::IsNull {
+            expr: Box::new(convert_expr(*expr)?),
+            negated: false,
+        }),
+        sql::Expr::IsNotNull(expr) => Ok(Expr::IsNull {
+            expr: Box::new(convert_expr(*expr)?),
+            negated: true,
+        }),
+        sql::Expr::Like {
+            negated,
+            any: false,
+            expr,
+            pattern,
+            escape_char: None,
+        } => Ok(Expr::Like {
+            expr: Box::new(convert_expr(*expr)?),
+            pattern: Box::new(convert_expr(*pattern)?),
+            negated,
+        }),
+        sql::Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Ok(Expr::InList {
+            expr: Box::new(convert_expr(*expr)?),
+            list: list
+                .into_iter()
+                .map(convert_expr)
+                .collect::<Result<Vec<_>, _>>()?,
+            negated,
+        }),
+        sql::Expr::InSubquery {
+            expr,
+            subquery,
+            negated,
+        } => Ok(Expr::InSubquery {
+            expr: Box::new(convert_expr(*expr)?),
+            query: Box::new(convert_query(*subquery)?),
+            negated,
+        }),
+        sql::Expr::Exists { subquery, negated } => Ok(Expr::Exists {
+            query: Box::new(convert_query(*subquery)?),
+            negated,
+        }),
+        sql::Expr::Subquery(query) => Ok(Expr::ScalarSubquery(Box::new(convert_query(*query)?))),
+        sql::Expr::Function(function) => convert_function(function),
+        other => Err(format!("Unsupported expression: {other}")),
+    }
+}
+
+fn convert_function(function: sql::Function) -> Result<Expr, String> {
+    if function.over.is_some() || function.filter.is_some() || !function.within_group.is_empty() {
+        return Err("Window/FILTER/WITHIN GROUP functions are unsupported".to_string());
+    }
+    let aggregate = match object_name(&function.name).as_str() {
+        "count" => AggregateFunction::Count,
+        "sum" => AggregateFunction::Sum,
+        "avg" => AggregateFunction::Avg,
+        "max" => AggregateFunction::Max,
+        "min" => AggregateFunction::Min,
+        name => return Err(format!("Unsupported function: {name}")),
+    };
+    let (arguments, distinct) = match function.args {
+        sql::FunctionArguments::List(arguments) => (
+            arguments.args,
+            arguments.duplicate_treatment == Some(sql::DuplicateTreatment::Distinct),
+        ),
+        _ => return Err("Aggregate functions require a normal argument list".to_string()),
+    };
+    if arguments.len() != 1 {
+        return Err("Aggregate functions require exactly one argument".to_string());
+    }
+    let expr = match arguments.into_iter().next().unwrap() {
+        sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Wildcard) => None,
+        sql::FunctionArg::Unnamed(sql::FunctionArgExpr::Expr(expr)) => {
+            Some(Box::new(convert_expr(expr)?))
+        }
+        _ => return Err("Unsupported aggregate argument".to_string()),
+    };
+    if expr.is_none() && aggregate != AggregateFunction::Count {
+        return Err("Only COUNT supports '*'".to_string());
+    }
+    Ok(Expr::Aggregate {
+        function: aggregate,
+        expr,
+        distinct,
+    })
+}
+
+fn convert_binary_op(op: sql::BinaryOperator) -> Result<BinaryOp, String> {
+    Ok(match op {
+        sql::BinaryOperator::Plus => BinaryOp::Add,
+        sql::BinaryOperator::Minus => BinaryOp::Subtract,
+        sql::BinaryOperator::Multiply => BinaryOp::Multiply,
+        sql::BinaryOperator::Divide => BinaryOp::Divide,
+        sql::BinaryOperator::Eq => BinaryOp::Compare(ComparisonOp::Equal),
+        sql::BinaryOperator::NotEq => BinaryOp::Compare(ComparisonOp::NotEqual),
+        sql::BinaryOperator::Lt => BinaryOp::Compare(ComparisonOp::LessThan),
+        sql::BinaryOperator::LtEq => BinaryOp::Compare(ComparisonOp::LessThanOrEqual),
+        sql::BinaryOperator::Gt => BinaryOp::Compare(ComparisonOp::GreaterThan),
+        sql::BinaryOperator::GtEq => BinaryOp::Compare(ComparisonOp::GreaterThanOrEqual),
+        sql::BinaryOperator::And => BinaryOp::And,
+        sql::BinaryOperator::Or => BinaryOp::Or,
+        other => return Err(format!("Unsupported binary operator: {other}")),
+    })
+}
+
+fn convert_value(value: sql::Value) -> Result<Value, String> {
+    match value {
+        sql::Value::Number(number, _) => {
+            if number.contains(['.', 'e', 'E']) {
+                number
+                    .parse()
+                    .map(Value::Float)
+                    .map_err(|_| format!("Invalid number: {number}"))
+            } else {
+                number
+                    .parse()
+                    .map(Value::Integer)
+                    .map_err(|_| format!("Invalid integer: {number}"))
+            }
+        }
+        sql::Value::SingleQuotedString(value)
+        | sql::Value::DoubleQuotedString(value)
+        | sql::Value::NationalStringLiteral(value)
+        | sql::Value::EscapedStringLiteral(value) => Ok(Value::Text(value)),
+        sql::Value::Boolean(value) => Ok(Value::Boolean(value)),
+        sql::Value::Null => Ok(Value::Null),
+        other => Err(format!("Unsupported literal: {other}")),
+    }
+}
+
+fn literal_value(expr: sql::Expr) -> Result<Value, String> {
+    match convert_expr(expr)? {
+        Expr::Literal(value) => Ok(value),
+        _ => Err("DEFAULT must be a literal".to_string()),
+    }
+}
+
+fn literal_usize(expr: sql::Expr) -> Result<usize, String> {
+    match convert_expr(expr)? {
+        Expr::Literal(Value::Integer(value)) if value >= 0 => Ok(value as usize),
+        _ => Err("LIMIT must be a non-negative integer".to_string()),
+    }
+}
+
+fn convert_data_type(data_type: &sql::DataType) -> Result<DataType, String> {
+    let text = data_type.to_string().to_ascii_uppercase();
+    if text.starts_with("INT")
+        || text.starts_with("INTEGER")
+        || text.starts_with("BIGINT")
+        || text.starts_with("SMALLINT")
+    {
+        Ok(DataType::Integer)
+    } else if text.starts_with("FLOAT")
+        || text.starts_with("DOUBLE")
+        || text.starts_with("REAL")
+        || text.starts_with("DECIMAL")
+        || text.starts_with("NUMERIC")
+    {
+        Ok(DataType::Float)
+    } else if text.starts_with("TEXT")
+        || text.starts_with("VARCHAR")
+        || text.starts_with("CHAR")
+        || text.starts_with("STRING")
+    {
+        Ok(DataType::Text)
+    } else if text.starts_with("BOOL") {
+        Ok(DataType::Boolean)
+    } else {
+        Err(format!("Unsupported data type: {data_type}"))
+    }
 }
 
 #[cfg(test)]
@@ -755,73 +807,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_create_table() {
-        let sql = "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)";
-        let stmt = parse_sql(sql).unwrap();
-        
-        if let Statement::CreateTable { table_name, columns, .. } = stmt {
-            assert_eq!(table_name, "users");
-            assert_eq!(columns.len(), 3);
-            assert!(columns[0].primary_key);
-            assert!(!columns[1].nullable);
-        } else {
-            panic!("Expected CreateTable statement");
+    fn parses_create_table_constraints() {
+        let statement = parse_sql(
+            "CREATE TABLE child (
+                id INT PRIMARY KEY,
+                parent_id INT,
+                score FLOAT CHECK (score >= 0),
+                UNIQUE (parent_id, score),
+                FOREIGN KEY (parent_id) REFERENCES parent(id)
+            )",
+        )
+        .unwrap();
+        match statement {
+            Statement::CreateTable {
+                columns,
+                constraints,
+                ..
+            } => {
+                assert_eq!(columns.len(), 3);
+                assert!(constraints.len() >= 4);
+            }
+            _ => panic!("expected create table"),
         }
     }
 
     #[test]
-    fn test_parse_insert() {
-        let sql = "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')";
-        let stmt = parse_sql(sql).unwrap();
-        
-        if let Statement::Insert { table_name, columns, values } = stmt {
-            assert_eq!(table_name, "users");
-            assert_eq!(columns.unwrap().len(), 2);
-            assert_eq!(values.len(), 2);
-        } else {
-            panic!("Expected Insert statement");
+    fn parses_advanced_query() {
+        let statement = parse_sql(
+            "WITH totals AS (
+                SELECT user_id, SUM(amount) AS total
+                FROM orders GROUP BY user_id
+            )
+            SELECT u.name, t.total
+            FROM users u LEFT JOIN totals t ON u.id = t.user_id
+            WHERE u.id IN (SELECT user_id FROM orders)
+            ORDER BY t.total DESC LIMIT 10",
+        )
+        .unwrap();
+        match statement {
+            Statement::Query(query) => {
+                assert_eq!(query.ctes.len(), 1);
+                assert_eq!(query.joins.len(), 1);
+                assert_eq!(query.limit, Some(10));
+            }
+            _ => panic!("expected query"),
         }
     }
 
     #[test]
-    fn test_parse_select() {
-        let sql = "SELECT name, age FROM users WHERE age > 18 ORDER BY name LIMIT 10";
-        let stmt = parse_sql(sql).unwrap();
-        
-        if let Statement::Select { columns: _, table_name, where_clause, order_by, limit } = stmt {
-            assert_eq!(table_name, "users");
-            assert!(where_clause.is_some());
-            assert!(order_by.is_some());
-            assert_eq!(limit, Some(10));
-        } else {
-            panic!("Expected Select statement");
-        }
-    }
-
-    #[test]
-    fn test_parse_update() {
-        let sql = "UPDATE users SET name = 'Charlie' WHERE id = 1";
-        let stmt = parse_sql(sql).unwrap();
-        
-        if let Statement::Update { table_name, assignments, where_clause } = stmt {
-            assert_eq!(table_name, "users");
-            assert_eq!(assignments.len(), 1);
-            assert!(where_clause.is_some());
-        } else {
-            panic!("Expected Update statement");
-        }
-    }
-
-    #[test]
-    fn test_parse_delete() {
-        let sql = "DELETE FROM users WHERE id = 1";
-        let stmt = parse_sql(sql).unwrap();
-        
-        if let Statement::Delete { table_name, where_clause } = stmt {
-            assert_eq!(table_name, "users");
-            assert!(where_clause.is_some());
-        } else {
-            panic!("Expected Delete statement");
-        }
+    fn parses_indexes_and_transactions() {
+        assert!(matches!(
+            parse_sql("CREATE UNIQUE INDEX idx_name ON users(name)").unwrap(),
+            Statement::CreateIndex { unique: true, .. }
+        ));
+        assert!(matches!(
+            parse_sql("DROP INDEX idx_name ON users").unwrap(),
+            Statement::DropIndex { .. }
+        ));
+        assert!(matches!(parse_sql("BEGIN").unwrap(), Statement::Begin));
     }
 }

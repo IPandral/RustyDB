@@ -17,12 +17,15 @@ use rustydb::{AppState, KVStore, SQLDatabase, ServerConfig, Value};
 fn test_config(port: u16) -> ServerConfig {
     ServerConfig {
         host: "127.0.0.1".to_string(),
-        port: 0,       // HTTP port - unused in wire tests
+        port: 0,        // HTTP port - unused in wire tests
         username: None, // no auth
         password: None,
         data_dir: String::new(),
         memory_only: true,
         wire_port: port,
+        plan_cache_capacity: 256,
+        memory_pool_capacity: 32,
+        bloom_false_positive_rate: 0.01,
     }
 }
 
@@ -35,6 +38,9 @@ fn test_config_with_auth(port: u16, user: &str, pass: &str) -> ServerConfig {
         data_dir: String::new(),
         memory_only: true,
         wire_port: port,
+        plan_cache_capacity: 256,
+        memory_pool_capacity: 32,
+        bloom_false_positive_rate: 0.01,
     }
 }
 
@@ -414,7 +420,12 @@ fn test_build_column_count() {
 
 #[test]
 fn test_build_column_def_structure() {
-    let pkt = build_column_def("id", "users", MYSQL_TYPE_LONGLONG, NOT_NULL_FLAG | PRI_KEY_FLAG);
+    let pkt = build_column_def(
+        "id",
+        "users",
+        MYSQL_TYPE_LONGLONG,
+        NOT_NULL_FLAG | PRI_KEY_FLAG,
+    );
 
     // Starts with lenenc_str "def" (catalog)
     assert_eq!(pkt[0], 3); // length
@@ -510,10 +521,7 @@ fn test_parse_client_handshake_basic() {
     assert_eq!(parsed.username, "testuser");
     assert_eq!(parsed.auth_response, vec![0xAA; 20]);
     assert!(parsed.database.is_none());
-    assert_eq!(
-        parsed.auth_plugin.as_deref(),
-        Some("mysql_native_password")
-    );
+    assert_eq!(parsed.auth_plugin.as_deref(), Some("mysql_native_password"));
 }
 
 #[test]
@@ -622,6 +630,15 @@ async fn send_query(stream: &mut TcpStream, query: &str) -> Vec<Vec<u8>> {
     }
 
     rows
+}
+
+async fn send_query_error(stream: &mut TcpStream, query: &str) -> String {
+    let mut payload = vec![COM_QUERY];
+    payload.extend_from_slice(query.as_bytes());
+    write_packet(stream, 0, &payload).await;
+    let (_seq, packet) = read_packet(stream).await;
+    assert_eq!(packet[0], 0xFF, "expected ERR packet");
+    String::from_utf8_lossy(&packet[9..]).to_string()
 }
 
 /// Send COM_PING and assert OK response.
@@ -940,12 +957,7 @@ async fn test_tcp_multiple_queries_same_connection() {
     // Execute many queries in sequence on the same connection
     for i in 1..=10 {
         let rows = send_query(&mut stream, "SELECT 1").await;
-        assert_eq!(
-            rows.len(),
-            1,
-            "query {} should return 1 row",
-            i
-        );
+        assert_eq!(rows.len(), 1, "query {} should return 1 row", i);
     }
 
     send_ping(&mut stream).await;
@@ -966,17 +978,100 @@ async fn test_tcp_transaction_statements() {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
         .await
         .expect("connect");
+    let mut observer = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .expect("connect observer");
 
     do_handshake(&mut stream, "test", "").await;
+    do_handshake(&mut observer, "test", "").await;
 
-    // These are all no-ops but should return OK
-    let stmts = ["BEGIN", "START TRANSACTION", "COMMIT", "ROLLBACK"];
-    for stmt in &stmts {
-        let rows = send_query(&mut stream, stmt).await;
-        assert!(rows.is_empty(), "{} should return OK (no rows)", stmt);
-    }
+    send_query(
+        &mut stream,
+        "CREATE TABLE wire_transactions (id INT PRIMARY KEY, value TEXT)",
+    )
+    .await;
+    send_query(&mut stream, "BEGIN").await;
+    send_query(
+        &mut stream,
+        "INSERT INTO wire_transactions VALUES (1, 'uncommitted')",
+    )
+    .await;
+    assert_eq!(
+        send_query(&mut stream, "SELECT * FROM wire_transactions")
+            .await
+            .len(),
+        1,
+        "transaction must read its writes"
+    );
+    assert_eq!(
+        send_query(&mut observer, "SELECT * FROM wire_transactions")
+            .await
+            .len(),
+        0,
+        "other connections must not see uncommitted rows"
+    );
+    send_query(&mut stream, "ROLLBACK").await;
+    assert_eq!(
+        send_query(&mut observer, "SELECT * FROM wire_transactions")
+            .await
+            .len(),
+        0,
+        "rollback must discard writes"
+    );
+
+    send_query(&mut stream, "START TRANSACTION").await;
+    send_query(
+        &mut stream,
+        "INSERT INTO wire_transactions VALUES (2, 'committed')",
+    )
+    .await;
+    send_query(&mut stream, "COMMIT").await;
+    assert_eq!(
+        send_query(&mut observer, "SELECT * FROM wire_transactions")
+            .await
+            .len(),
+        1,
+        "commit must publish writes atomically"
+    );
 
     send_quit(&mut stream).await;
+    send_quit(&mut observer).await;
+}
+
+#[tokio::test]
+async fn test_tcp_transaction_serialization_conflict() {
+    let port = random_port().await;
+    let state = test_app_state(test_config(port));
+    let wire_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        let _ = rustydb::start_wire_server(wire_state, port).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let mut first = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("connect first");
+    let mut second = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("connect second");
+    do_handshake(&mut first, "test", "").await;
+    do_handshake(&mut second, "test", "").await;
+
+    send_query(
+        &mut first,
+        "CREATE TABLE wire_conflicts (id INT PRIMARY KEY)",
+    )
+    .await;
+    send_query(&mut first, "BEGIN").await;
+    send_query(&mut second, "BEGIN").await;
+    send_query(&mut first, "INSERT INTO wire_conflicts VALUES (1)").await;
+    send_query(&mut second, "INSERT INTO wire_conflicts VALUES (2)").await;
+    send_query(&mut first, "COMMIT").await;
+    let error = send_query_error(&mut second, "COMMIT").await;
+    assert!(error.contains("Serialization conflict"));
+
+    send_quit(&mut first).await;
+    send_quit(&mut second).await;
 }
 
 #[tokio::test]

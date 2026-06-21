@@ -68,15 +68,6 @@ fn try_handle_system_query(query: &str) -> Option<ExecutionResult> {
         return Some(ExecutionResult::RowsAffected(0));
     }
 
-    // Transaction control (no-op since we don't support transactions)
-    if upper.starts_with("BEGIN")
-        || upper.starts_with("START TRANSACTION")
-        || upper.starts_with("COMMIT")
-        || upper.starts_with("ROLLBACK")
-    {
-        return Some(ExecutionResult::RowsAffected(0));
-    }
-
     // KILL
     if upper.starts_with("KILL") {
         return Some(ExecutionResult::RowsAffected(0));
@@ -95,9 +86,7 @@ fn try_handle_system_query(query: &str) -> Option<ExecutionResult> {
     }
 
     // SELECT USER() / CURRENT_USER()
-    if upper.starts_with("SELECT")
-        && (upper.contains("USER()") || upper.contains("CURRENT_USER"))
-    {
+    if upper.starts_with("SELECT") && (upper.contains("USER()") || upper.contains("CURRENT_USER")) {
         let mut rs = ResultSet::new(vec!["USER()".to_string()]);
         rs.add_row(Row::new(vec![Value::Text(
             "rustydb_user@localhost".to_string(),
@@ -134,10 +123,7 @@ fn try_handle_system_query(query: &str) -> Option<ExecutionResult> {
         && !upper.starts_with("SHOW TABLES")
         && !upper.starts_with("SHOW CREATE")
     {
-        let rs = ResultSet::new(vec![
-            "Variable_name".to_string(),
-            "Value".to_string(),
-        ]);
+        let rs = ResultSet::new(vec!["Variable_name".to_string(), "Value".to_string()]);
         return Some(ExecutionResult::Select(rs));
     }
 
@@ -219,24 +205,29 @@ fn handle_sysvar_query(query: &str) -> ExecutionResult {
     ExecutionResult::Select(rs)
 }
 
-fn encode_result(result: &ExecutionResult) -> Vec<Vec<u8>> {
+fn encode_result(result: &ExecutionResult, status: u16) -> Vec<Vec<u8>> {
     match result {
-        ExecutionResult::Select(rs) => encode_result_set(rs, ""),
-        ExecutionResult::RowsAffected(n) => {
-            vec![build_ok_packet(*n as u64, 0)]
-        }
+        ExecutionResult::Select(rs) => encode_result_set(rs, "", status),
+        ExecutionResult::RowsAffected(n) => vec![build_ok_packet_with_status(*n as u64, 0, status)],
         ExecutionResult::TableCreated(_name) => {
-            vec![build_ok_packet(0, 0)]
+            vec![build_ok_packet_with_status(0, 0, status)]
         }
         ExecutionResult::TableDropped(_name) => {
-            vec![build_ok_packet(0, 0)]
+            vec![build_ok_packet_with_status(0, 0, status)]
+        }
+        ExecutionResult::IndexCreated(_)
+        | ExecutionResult::IndexDropped(_)
+        | ExecutionResult::TransactionStarted
+        | ExecutionResult::TransactionCommitted
+        | ExecutionResult::TransactionRolledBack => {
+            vec![build_ok_packet_with_status(0, 0, status)]
         }
         ExecutionResult::Tables(tables) => {
             let mut rs = ResultSet::new(vec!["Tables_in_rustydb".to_string()]);
             for t in tables {
                 rs.add_row(Row::new(vec![Value::Text(t.clone())]));
             }
-            encode_result_set(&rs, "")
+            encode_result_set(&rs, "", status)
         }
         ExecutionResult::TableDescription {
             table_name,
@@ -260,7 +251,31 @@ fn encode_result(result: &ExecutionResult) -> Vec<Vec<u8>> {
                     Value::Text(String::new()),
                 ]));
             }
-            encode_result_set(&rs, table_name)
+            encode_result_set(&rs, table_name, status)
+        }
+        ExecutionResult::Indexes(indexes) => {
+            let mut rs = ResultSet::new(vec![
+                "Key_name".to_string(),
+                "Column_name".to_string(),
+                "Non_unique".to_string(),
+            ]);
+            for index in indexes {
+                for column in &index.columns {
+                    rs.add_row(Row::new(vec![
+                        Value::Text(index.name.clone()),
+                        Value::Text(column.clone()),
+                        Value::Integer(if index.unique { 0 } else { 1 }),
+                    ]));
+                }
+            }
+            encode_result_set(&rs, "", status)
+        }
+        ExecutionResult::Explain(lines) => {
+            let mut rs = ResultSet::new(vec!["plan".to_string()]);
+            for line in lines {
+                rs.add_row(Row::new(vec![Value::Text(line.clone())]));
+            }
+            encode_result_set(&rs, "", status)
         }
         ExecutionResult::Error(msg) => {
             vec![build_err_packet(1064, "42000", msg)]
@@ -269,7 +284,7 @@ fn encode_result(result: &ExecutionResult) -> Vec<Vec<u8>> {
 }
 
 /// Encode a ResultSet as MySQL text protocol packets.
-fn encode_result_set(rs: &ResultSet, table_name: &str) -> Vec<Vec<u8>> {
+fn encode_result_set(rs: &ResultSet, table_name: &str, status: u16) -> Vec<Vec<u8>> {
     let mut packets = Vec::new();
 
     // Column count
@@ -294,7 +309,7 @@ fn encode_result_set(rs: &ResultSet, table_name: &str) -> Vec<Vec<u8>> {
     }
 
     // EOF after column definitions
-    packets.push(build_eof_packet());
+    packets.push(build_eof_packet_with_status(status));
 
     // Row data
     for row in &rs.rows {
@@ -303,7 +318,7 @@ fn encode_result_set(rs: &ResultSet, table_name: &str) -> Vec<Vec<u8>> {
     }
 
     // EOF after rows
-    packets.push(build_eof_packet());
+    packets.push(build_eof_packet_with_status(status));
 
     packets
 }
@@ -357,10 +372,7 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
         let err = build_err_packet(
             1045,
             "28000",
-            &format!(
-                "Access denied for user '{}'@'{}'",
-                handshake.username, peer
-            ),
+            &format!("Access denied for user '{}'@'{}'", handshake.username, peer),
         );
         let _ = write_packet(&mut stream, 2, &err).await;
         eprintln!(
@@ -380,6 +392,9 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
         "[wire] User '{}' authenticated (conn {})",
         handshake.username, conn_id
     );
+
+    // Each wire connection owns a transaction/session context.
+    let session = state.sql_db.session();
 
     // === COMMAND PHASE ===
     loop {
@@ -428,10 +443,15 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
                 let result = if let Some(sys_result) = try_handle_system_query(&query) {
                     sys_result
                 } else {
-                    state.sql_db.execute(&query)
+                    session.execute(&query)
                 };
 
-                let packets = encode_result(&result);
+                let status = if session.is_in_transaction() {
+                    SERVER_STATUS_IN_TRANS
+                } else {
+                    SERVER_STATUS_AUTOCOMMIT
+                };
+                let packets = encode_result(&result, status);
                 if write_packets(&mut stream, 1, &packets).await.is_err() {
                     break;
                 }

@@ -1,17 +1,6 @@
-mod kvstore;
-mod persistence;
-mod sql;
-
-#[cfg(feature = "server")]
-mod server;
-
-#[cfg(feature = "server")]
-mod wire;
-
-use kvstore::KVStore;
-use sql::SQLDatabase;
-use std::io::{self, Write};
+use rustydb::{KVStore, SQLDatabase};
 use std::env;
+use std::io::{self, Write};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -27,7 +16,7 @@ fn main() {
 
     #[cfg(feature = "server")]
     if use_server_mode {
-        run_server_mode();
+        run_server_mode(use_memory_only, data_dir);
         return;
     }
 
@@ -38,7 +27,7 @@ fn main() {
         return;
     }
 
-    println!("RustyDB v0.2.0");
+    println!("RustyDB v0.3.0-beta");
     println!("A high-performance database with KV and SQL support");
     println!("Type 'help' for available commands\n");
 
@@ -50,10 +39,16 @@ fn main() {
 }
 
 #[cfg(feature = "server")]
-fn run_server_mode() {
-    use server::{ServerConfig, start_server};
+fn run_server_mode(memory_only: bool, data_dir: &str) {
+    use rustydb::{ServerConfig, start_server};
 
-    let config = ServerConfig::from_env();
+    let mut config = ServerConfig::from_env();
+    if memory_only {
+        config.memory_only = true;
+    }
+    if data_dir != "./rustydb_data" {
+        config.data_dir = data_dir.to_string();
+    }
 
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
     rt.block_on(async {
@@ -91,6 +86,7 @@ fn run_sql_mode(data_dir: &str, memory_only: bool) {
 
     let mut multiline_buffer = String::new();
     let mut in_multiline = false;
+    let session = db.session();
 
     loop {
         if in_multiline {
@@ -158,7 +154,7 @@ fn run_sql_mode(data_dir: &str, memory_only: bool) {
         multiline_buffer.push(' ');
 
         let trimmed = multiline_buffer.trim();
-        let is_complete = trimmed.ends_with(';') 
+        let is_complete = trimmed.ends_with(';')
             || trimmed.to_uppercase().starts_with("SHOW ")
             || trimmed.to_uppercase().starts_with("DESCRIBE ")
             || trimmed.to_uppercase().starts_with("DESC ");
@@ -176,8 +172,8 @@ fn run_sql_mode(data_dir: &str, memory_only: bool) {
             continue;
         }
 
-        let result = db.execute(&sql);
-        println!("{}", result.to_string());
+        let result = session.execute(&sql);
+        println!("{result}");
     }
 }
 
@@ -327,7 +323,7 @@ fn run_kv_mode(data_dir: &str, memory_only: bool) {
 
             "mset" | "setmany" | "set_many" => {
                 let all_parts: Vec<&str> = input.split_whitespace().collect();
-                if all_parts.len() < 3 || (all_parts.len() - 1) % 2 != 0 {
+                if all_parts.len() < 3 || !(all_parts.len() - 1).is_multiple_of(2) {
                     println!("Error: MSET requires key-value pairs");
                     println!("Usage: MSET <key1> <value1> <key2> <value2> ...");
                     continue;
@@ -399,13 +395,18 @@ fn print_sql_help() {
     println!("  =================\n");
     println!("  SQL Commands:");
     println!("    CREATE TABLE name (col1 TYPE, col2 TYPE, ...)");
+    println!("    CREATE [UNIQUE] INDEX name ON table (col1, ...)");
+    println!("    DROP INDEX name ON table");
     println!("    DROP TABLE name");
     println!("    INSERT INTO table VALUES (val1, val2, ...)");
-    println!("    SELECT columns FROM table [WHERE ...] [ORDER BY ...] [LIMIT n]");
+    println!("    SELECT ... FROM ... [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...]");
     println!("    UPDATE table SET col = val [WHERE ...]");
     println!("    DELETE FROM table [WHERE ...]");
     println!("    SHOW TABLES");
+    println!("    SHOW INDEXES FROM table");
     println!("    DESCRIBE table");
+    println!("    EXPLAIN SELECT ...");
+    println!("    BEGIN, COMMIT, ROLLBACK");
     println!();
     println!("  Data Types:");
     println!("    INTEGER, INT        - Integer numbers");
@@ -415,6 +416,9 @@ fn print_sql_help() {
     println!();
     println!("  Column Modifiers:");
     println!("    PRIMARY KEY         - Unique identifier");
+    println!("    UNIQUE              - Unique column or column group");
+    println!("    CHECK (expression)  - Row validation");
+    println!("    FOREIGN KEY (...) REFERENCES table (...) - Referential integrity");
     println!("    NOT NULL            - Cannot be NULL");
     println!();
     println!("  WHERE Operators:");

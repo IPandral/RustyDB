@@ -157,6 +157,11 @@ class BenchResult:
     def max(self):
         return self.times[-1]
 
+    @property
+    def p95(self):
+        index = max(0, math.ceil(len(self.times) * 0.95) - 1)
+        return self.times[index]
+
 
 # ---------------------------------------------------------------------------
 # Timing harness
@@ -183,6 +188,54 @@ def run_bench(conn, name, setup_fn, bench_fn, teardown_fn, warmup, iterations):
     teardown_fn(conn)
 
     return BenchResult(name, times)
+
+
+ORDERED_RESULT_BENCHMARKS = {
+    "select_order_by",
+    "select_order_limit",
+}
+
+
+def canonical_value(value):
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) or value.__class__.__name__ == "Decimal":
+        return round(float(value), 2)
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
+
+
+def canonical_result(name, result):
+    if not isinstance(result, list):
+        return result
+    rows = [tuple(canonical_value(value) for value in row) for row in result]
+    if name not in ORDERED_RESULT_BENCHMARKS:
+        rows.sort(key=repr)
+    return rows
+
+
+def validate_benchmark_pair(rustydb_conn, mysql_conn, name, setup_fn, bench_fn, teardown_fn):
+    """Run once on both engines and fail before timing if results differ."""
+    try:
+        setup_fn(rustydb_conn)
+        setup_fn(mysql_conn)
+        rustydb_result = canonical_result(
+            name, bench_fn(rustydb_conn, {"counter": 0})
+        )
+        mysql_result = canonical_result(
+            name, bench_fn(mysql_conn, {"counter": 0})
+        )
+        if rustydb_result != mysql_result:
+            raise AssertionError(
+                f"{name}: RustyDB result {rustydb_result!r} "
+                f"does not match MySQL result {mysql_result!r}"
+            )
+    finally:
+        teardown_fn(rustydb_conn)
+        teardown_fn(mysql_conn)
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +310,7 @@ def build_benchmarks():
 
     def ct_bench(conn, state):
         safe_drop(conn, "test")
-        execute(conn, "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, value FLOAT)")
+        return execute(conn, "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT, value FLOAT)")
 
     def ct_teardown(conn):
         safe_drop(conn, "test")
@@ -273,7 +326,7 @@ def build_benchmarks():
 
     def ins_bench(conn, state):
         i = 100_000 + state["counter"]
-        execute(conn, f"INSERT INTO test VALUES ({i}, 'name_{i}', {i}.99)")
+        return execute(conn, f"INSERT INTO test VALUES ({i}, 'name_{i}', {i}.99)")
 
     def ins_teardown(conn):
         safe_drop(conn, "test")
@@ -287,7 +340,7 @@ def build_benchmarks():
         batch_insert(conn, "test", gen_basic_rows(1000))
 
     def sa_bench(conn, state):
-        execute(conn, "SELECT * FROM test")
+        return execute(conn, "SELECT * FROM test")
 
     def sa_teardown(conn):
         safe_drop(conn, "test")
@@ -304,13 +357,13 @@ def build_benchmarks():
         safe_drop(conn, "test")
 
     def sw_eq(conn, state):
-        execute(conn, "SELECT * FROM test WHERE category = 'Electronics'")
+        return execute(conn, "SELECT * FROM test WHERE category = 'Electronics'")
 
     def sw_cmp(conn, state):
-        execute(conn, "SELECT * FROM test WHERE value > 500")
+        return execute(conn, "SELECT * FROM test WHERE value > 500")
 
     def sw_and(conn, state):
-        execute(conn, "SELECT * FROM test WHERE category = 'Electronics' AND value > 500")
+        return execute(conn, "SELECT * FROM test WHERE category = 'Electronics' AND value > 500")
 
     benchmarks.append(("select_where_eq", sw_setup, sw_eq, sw_teardown))
     benchmarks.append(("select_where_cmp", sw_setup, sw_cmp, sw_teardown))
@@ -326,10 +379,10 @@ def build_benchmarks():
         safe_drop(conn, "test")
 
     def sl_suffix(conn, state):
-        execute(conn, "SELECT * FROM test WHERE email LIKE '%@gmail.com'")
+        return execute(conn, "SELECT * FROM test WHERE email LIKE '%@gmail.com'")
 
     def sl_prefix(conn, state):
-        execute(conn, "SELECT * FROM test WHERE name LIKE 'user_1%'")
+        return execute(conn, "SELECT * FROM test WHERE name LIKE 'user_1%'")
 
     benchmarks.append(("select_like_suffix", sl_setup, sl_suffix, sl_teardown))
     benchmarks.append(("select_like_prefix", sl_setup, sl_prefix, sl_teardown))
@@ -344,10 +397,10 @@ def build_benchmarks():
         safe_drop(conn, "test")
 
     def so_order(conn, state):
-        execute(conn, "SELECT * FROM test ORDER BY value DESC")
+        return execute(conn, "SELECT * FROM test ORDER BY value DESC")
 
     def so_limit(conn, state):
-        execute(conn, "SELECT * FROM test ORDER BY value DESC LIMIT 10")
+        return execute(conn, "SELECT * FROM test ORDER BY value DESC LIMIT 10")
 
     benchmarks.append(("select_order_by", so_setup, so_order, so_teardown))
     benchmarks.append(("select_order_limit", so_setup, so_limit, so_teardown))
@@ -363,11 +416,11 @@ def build_benchmarks():
 
     def up_single(conn, state):
         i = state["counter"] % 1000
-        execute(conn, f"UPDATE test SET value = {state['counter'] * 1.0} WHERE id = {i}")
+        return execute(conn, f"UPDATE test SET value = {state['counter'] * 1.0} WHERE id = {i}")
 
     def up_multi(conn, state):
         threshold = (state["counter"] % 500) * 1.0
-        execute(conn, f"UPDATE test SET active = FALSE WHERE value < {threshold}")
+        return execute(conn, f"UPDATE test SET active = FALSE WHERE value < {threshold}")
 
     benchmarks.append(("update_single", up_setup, up_single, up_teardown))
     benchmarks.append(("update_multi", up_setup, up_multi, up_teardown))
@@ -382,7 +435,7 @@ def build_benchmarks():
         safe_drop(conn, "test")
 
     def del_bench(conn, state):
-        execute(conn, f"DELETE FROM test WHERE id = {state['counter']}")
+        return execute(conn, f"DELETE FROM test WHERE id = {state['counter']}")
 
     benchmarks.append(("delete_single", del_setup, del_bench, del_teardown))
 
@@ -400,17 +453,17 @@ def build_benchmarks():
         op = counter % 20
         if op < 12:
             if op < 4:
-                execute(conn, "SELECT * FROM products WHERE price > 100")
+                return execute(conn, "SELECT * FROM products WHERE price > 100")
             elif op < 8:
-                execute(conn, f"SELECT * FROM products WHERE id = {counter % 500}")
+                return execute(conn, f"SELECT * FROM products WHERE id = {counter % 500}")
             else:
-                execute(conn, "SELECT * FROM products ORDER BY price DESC LIMIT 10")
+                return execute(conn, "SELECT * FROM products ORDER BY price DESC LIMIT 10")
         elif op < 16:
-            execute(conn, f"UPDATE products SET stock = {counter} WHERE id = {counter % 500}")
+            return execute(conn, f"UPDATE products SET stock = {counter} WHERE id = {counter % 500}")
         elif op < 19:
-            execute(conn, f"INSERT INTO products VALUES ({counter}, 'new_product_{counter}', {counter % 1000}.99, {counter * 5})")
+            return execute(conn, f"INSERT INTO products VALUES ({counter}, 'new_product_{counter}', {counter % 1000}.99, {counter * 5})")
         else:
-            execute(conn, f"DELETE FROM products WHERE id = {counter}")
+            return execute(conn, f"DELETE FROM products WHERE id = {counter}")
 
     benchmarks.append(("mixed_workload", mx_setup, mx_bench, mx_teardown))
 
@@ -423,7 +476,7 @@ def build_benchmarks():
                 batch_insert(conn, "test", gen_basic_rows(sz))
 
             def ts_bench(conn, state):
-                execute(conn, "SELECT * FROM test WHERE value > 50")
+                return execute(conn, "SELECT * FROM test WHERE value > 50")
 
             def ts_teardown(conn):
                 safe_drop(conn, "test")
@@ -447,13 +500,82 @@ def build_benchmarks():
         safe_drop(conn, "users")
 
     def cq_and_or(conn, state):
-        execute(conn, "SELECT * FROM orders WHERE status = 'completed' AND amount > 500")
+        return execute(conn, "SELECT * FROM orders WHERE status = 'completed' AND amount > 500")
 
     def cq_multi(conn, state):
-        execute(conn, "SELECT * FROM users WHERE age > 30 AND active = TRUE")
+        return execute(conn, "SELECT * FROM users WHERE age > 30 AND active = TRUE")
 
     benchmarks.append(("complex_and_or", cq_setup, cq_and_or, cq_teardown))
     benchmarks.append(("complex_multi", cq_setup, cq_multi, cq_teardown))
+
+    # 20. composite B-tree range lookup (100K rows)
+    def ix_setup(conn):
+        safe_drop(conn, "indexed_events")
+        execute(conn, "CREATE TABLE indexed_events (id INTEGER, category VARCHAR(32), sequence INTEGER)")
+        rows = [f"({i}, 'category_{i % 20}', {i})" for i in range(100000)]
+        batch_insert(conn, "indexed_events", rows, batch_size=100000)
+        execute(conn, "CREATE INDEX events_category_sequence ON indexed_events(category, sequence)")
+
+    def ix_bench(conn, state):
+        return execute(
+            conn,
+            "SELECT * FROM indexed_events "
+            "WHERE category = 'category_7' AND sequence >= 99500",
+        )
+
+    def ix_teardown(conn):
+        safe_drop(conn, "indexed_events")
+
+    benchmarks.append(("indexed_range_100k", ix_setup, ix_bench, ix_teardown))
+
+    # 21-22. hash join/aggregate and CTE/subquery
+    def ja_setup(conn):
+        safe_drop(conn, "bench_orders")
+        safe_drop(conn, "bench_users")
+        execute(conn, "CREATE TABLE bench_users (id INTEGER PRIMARY KEY, team VARCHAR(32))")
+        execute(conn, "CREATE TABLE bench_orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount FLOAT, status VARCHAR(16))")
+        batch_insert(
+            conn,
+            "bench_users",
+            [f"({i}, 'team_{i % 10}')" for i in range(1000)],
+            batch_size=1000,
+        )
+        rows = [
+            f"({i}, {i % 1000}, {i % 500}.99, '{'paid' if i % 2 == 0 else 'pending'}')"
+            for i in range(10000)
+        ]
+        batch_insert(conn, "bench_orders", rows, batch_size=10000)
+        execute(conn, "CREATE INDEX bench_orders_user_status ON bench_orders(user_id, status)")
+
+    def ja_bench(conn, state):
+        return execute(
+            conn,
+            "SELECT bench_users.team, COUNT(*), SUM(bench_orders.amount) "
+            "FROM bench_users INNER JOIN bench_orders "
+            "ON bench_users.id = bench_orders.user_id "
+            "WHERE bench_orders.status = 'paid' "
+            "GROUP BY bench_users.team HAVING COUNT(*) > 0",
+        )
+
+    def cte_bench(conn, state):
+        return execute(
+            conn,
+            "WITH paid AS ("
+            " SELECT user_id, SUM(amount) AS total"
+            " FROM bench_orders WHERE status = 'paid' GROUP BY user_id"
+            ") "
+            "SELECT bench_users.id, paid.total "
+            "FROM bench_users LEFT JOIN paid ON bench_users.id = paid.user_id "
+            "WHERE bench_users.id IN (SELECT user_id FROM bench_orders WHERE amount > 250) "
+            "ORDER BY paid.total DESC LIMIT 25",
+        )
+
+    def ja_teardown(conn):
+        safe_drop(conn, "bench_orders")
+        safe_drop(conn, "bench_users")
+
+    benchmarks.append(("join_group_aggregate", ja_setup, ja_bench, ja_teardown))
+    benchmarks.append(("cte_subquery", ja_setup, cte_bench, ja_teardown))
 
     return benchmarks
 
@@ -542,10 +664,12 @@ def print_comparison(rustydb_results, mysql_results, args):
         print(f"\n  {name}")
         if r:
             print(f"    RustyDB  mean={fmt_ms(r.mean):>10s}  median={fmt_ms(r.median):>10s}  "
-                  f"min={fmt_ms(r.min):>10s}  max={fmt_ms(r.max):>10s}  stdev={fmt_ms(r.stdev):>10s}")
+                  f"p95={fmt_ms(r.p95):>10s}  min={fmt_ms(r.min):>10s}  "
+                  f"max={fmt_ms(r.max):>10s}  stdev={fmt_ms(r.stdev):>10s}")
         if m:
             print(f"    MySQL    mean={fmt_ms(m.mean):>10s}  median={fmt_ms(m.median):>10s}  "
-                  f"min={fmt_ms(m.min):>10s}  max={fmt_ms(m.max):>10s}  stdev={fmt_ms(m.stdev):>10s}")
+                  f"p95={fmt_ms(m.p95):>10s}  min={fmt_ms(m.min):>10s}  "
+                  f"max={fmt_ms(m.max):>10s}  stdev={fmt_ms(m.stdev):>10s}")
 
     print()
 
@@ -562,8 +686,8 @@ def write_csv(path, rustydb_results, mysql_results):
         w = csv.writer(f)
         w.writerow([
             "benchmark",
-            "rustydb_median_ms", "rustydb_mean_ms", "rustydb_min_ms", "rustydb_max_ms", "rustydb_stdev_ms",
-            "mysql_median_ms", "mysql_mean_ms", "mysql_min_ms", "mysql_max_ms", "mysql_stdev_ms",
+            "rustydb_median_ms", "rustydb_p95_ms", "rustydb_mean_ms", "rustydb_min_ms", "rustydb_max_ms", "rustydb_stdev_ms",
+            "mysql_median_ms", "mysql_p95_ms", "mysql_mean_ms", "mysql_min_ms", "mysql_max_ms", "mysql_stdev_ms",
             "ratio",
         ])
         for name in all_names:
@@ -575,11 +699,13 @@ def write_csv(path, rustydb_results, mysql_results):
             w.writerow([
                 name,
                 f"{r.median:.4f}" if r else "",
+                f"{r.p95:.4f}" if r else "",
                 f"{r.mean:.4f}" if r else "",
                 f"{r.min:.4f}" if r else "",
                 f"{r.max:.4f}" if r else "",
                 f"{r.stdev:.4f}" if r else "",
                 f"{m.median:.4f}" if m else "",
+                f"{m.p95:.4f}" if m else "",
                 f"{m.mean:.4f}" if m else "",
                 f"{m.min:.4f}" if m else "",
                 f"{m.max:.4f}" if m else "",
@@ -633,6 +759,19 @@ def main():
     if not rustydb_conn and not mysql_conn:
         print("\nNo targets available. Nothing to benchmark.")
         sys.exit(1)
+
+    if rustydb_conn and mysql_conn:
+        print(f"\nValidating {len(benchmarks)} benchmark results before timing...")
+        for name, setup_fn, bench_fn, teardown_fn in benchmarks:
+            validate_benchmark_pair(
+                rustydb_conn,
+                mysql_conn,
+                name,
+                setup_fn,
+                bench_fn,
+                teardown_fn,
+            )
+        print(f"  Correctness: {len(benchmarks)}/{len(benchmarks)} passed")
 
     print(f"\nRunning {len(benchmarks)} benchmarks  (warmup={args.warmup}, iterations={args.iterations})")
     print()

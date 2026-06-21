@@ -1,10 +1,10 @@
 use axum::{
+    Json, Router,
     extract::{Path, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
-    Json, Router,
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::kvstore::KVStore;
-use crate::sql::{ExecutionResult, SQLDatabase};
+use crate::sql::{ExecutionResult, SQLDatabase, SQLDatabaseOptions};
 
 /// Server configuration from environment variables
 pub struct ServerConfig {
@@ -24,6 +24,9 @@ pub struct ServerConfig {
     pub data_dir: String,
     pub memory_only: bool,
     pub wire_port: u16,
+    pub plan_cache_capacity: usize,
+    pub memory_pool_capacity: usize,
+    pub bloom_false_positive_rate: f64,
 }
 
 impl ServerConfig {
@@ -45,6 +48,18 @@ impl ServerConfig {
                 .ok()
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(3307),
+            plan_cache_capacity: env::var("RUSTYDB_PLAN_CACHE_CAPACITY")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(256),
+            memory_pool_capacity: env::var("RUSTYDB_MEMORY_POOL_CAPACITY")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(32),
+            bloom_false_positive_rate: env::var("RUSTYDB_BLOOM_FALSE_POSITIVE_RATE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0.01),
         }
     }
 
@@ -246,10 +261,7 @@ async fn auth_middleware(
 }
 
 /// GET /kv/:key - Get a value by key
-async fn kv_get(
-    State(state): State<Arc<AppState>>,
-    Path(key): Path<String>,
-) -> impl IntoResponse {
+async fn kv_get(State(state): State<Arc<AppState>>, Path(key): Path<String>) -> impl IntoResponse {
     match state.kv_store.get(&key) {
         Ok(Some(value)) => (
             StatusCode::OK,
@@ -267,11 +279,14 @@ async fn kv_get(
                 exists: false,
             })),
         ),
-        Err(_e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiResponse::success(ValueResponse {
-            key,
-            value: None,
-            exists: false,
-        }))),
+        Err(_e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::success(ValueResponse {
+                key,
+                value: None,
+                exists: false,
+            })),
+        ),
     }
 }
 
@@ -370,7 +385,10 @@ async fn kv_get_many(
                 .keys
                 .iter()
                 .map(|key| {
-                    let value = results.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_ref().clone());
+                    let value = results
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.as_ref().clone());
                     ValueResponse {
                         key: key.clone(),
                         value: value.clone(),
@@ -392,11 +410,7 @@ async fn kv_set_many(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SetManyRequest>,
 ) -> impl IntoResponse {
-    let pairs: Vec<(String, String)> = body
-        .pairs
-        .into_iter()
-        .map(|p| (p.key, p.value))
-        .collect();
+    let pairs: Vec<(String, String)> = body.pairs.into_iter().map(|p| (p.key, p.value)).collect();
     let count = pairs.len();
 
     match state.kv_store.set_many(pairs) {
@@ -493,11 +507,9 @@ fn value_to_json(value: &crate::sql::Value) -> serde_json::Value {
     match value {
         crate::sql::Value::Null => serde_json::Value::Null,
         crate::sql::Value::Integer(i) => serde_json::Value::Number((*i).into()),
-        crate::sql::Value::Float(f) => {
-            serde_json::Number::from_f64(*f)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
-        }
+        crate::sql::Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
         crate::sql::Value::Text(s) => serde_json::Value::String(s.clone()),
         crate::sql::Value::Boolean(b) => serde_json::Value::Bool(*b),
     }
@@ -560,6 +572,28 @@ async fn sql_execute(
             schema: None,
             message: Some(format!("Table '{}' dropped", name)),
         },
+        ExecutionResult::IndexCreated(name) => SqlResultResponse {
+            query: body.query,
+            result_type: "index_created".to_string(),
+            rows_affected: None,
+            table_name: Some(name.clone()),
+            tables: None,
+            columns: None,
+            rows: None,
+            schema: None,
+            message: Some(format!("Index '{}' created", name)),
+        },
+        ExecutionResult::IndexDropped(name) => SqlResultResponse {
+            query: body.query,
+            result_type: "index_dropped".to_string(),
+            rows_affected: None,
+            table_name: Some(name.clone()),
+            tables: None,
+            columns: None,
+            rows: None,
+            schema: None,
+            message: Some(format!("Index '{}' dropped", name)),
+        },
         ExecutionResult::Tables(tables) => SqlResultResponse {
             query: body.query,
             result_type: "tables".to_string(),
@@ -571,7 +605,10 @@ async fn sql_execute(
             schema: None,
             message: None,
         },
-        ExecutionResult::TableDescription { table_name, columns } => SqlResultResponse {
+        ExecutionResult::TableDescription {
+            table_name,
+            columns,
+        } => SqlResultResponse {
             query: body.query,
             result_type: "describe".to_string(),
             rows_affected: None,
@@ -591,6 +628,61 @@ async fn sql_execute(
                     .collect(),
             ),
             message: None,
+        },
+        ExecutionResult::Indexes(indexes) => SqlResultResponse {
+            query: body.query,
+            result_type: "indexes".to_string(),
+            rows_affected: None,
+            table_name: None,
+            tables: None,
+            columns: Some(vec![
+                "name".to_string(),
+                "columns".to_string(),
+                "unique".to_string(),
+            ]),
+            rows: Some(
+                indexes
+                    .into_iter()
+                    .map(|index| {
+                        vec![
+                            serde_json::Value::String(index.name),
+                            serde_json::Value::String(index.columns.join(", ")),
+                            serde_json::Value::Bool(index.unique),
+                        ]
+                    })
+                    .collect(),
+            ),
+            schema: None,
+            message: None,
+        },
+        ExecutionResult::Explain(lines) => SqlResultResponse {
+            query: body.query,
+            result_type: "explain".to_string(),
+            rows_affected: None,
+            table_name: None,
+            tables: None,
+            columns: Some(vec!["plan".to_string()]),
+            rows: Some(
+                lines
+                    .into_iter()
+                    .map(|line| vec![serde_json::Value::String(line)])
+                    .collect(),
+            ),
+            schema: None,
+            message: None,
+        },
+        transaction_result @ (ExecutionResult::TransactionStarted
+        | ExecutionResult::TransactionCommitted
+        | ExecutionResult::TransactionRolledBack) => SqlResultResponse {
+            query: body.query,
+            result_type: "transaction".to_string(),
+            rows_affected: None,
+            table_name: None,
+            tables: None,
+            columns: None,
+            rows: None,
+            schema: None,
+            message: Some(transaction_result.to_string()),
         },
         ExecutionResult::Error(e) => {
             return (
@@ -640,7 +732,7 @@ async fn health_check() -> impl IntoResponse {
         StatusCode::OK,
         Json(ApiResponse::success(serde_json::json!({
             "status": "healthy",
-            "version": "0.2.0"
+            "version": "0.3.0-beta"
         }))),
     )
 }
@@ -672,7 +764,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     let protected_routes = Router::new()
         .nest("/kv", kv_routes)
         .nest("/sql", sql_routes)
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     Router::new()
         .route("/health", get(health_check))
@@ -689,10 +784,16 @@ pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error
         KVStore::open(&config.data_dir).unwrap_or_else(|_| KVStore::new())
     };
 
+    let sql_options = SQLDatabaseOptions {
+        plan_cache_capacity: config.plan_cache_capacity,
+        memory_pool_capacity: config.memory_pool_capacity,
+        bloom_false_positive_rate: config.bloom_false_positive_rate,
+    };
     let sql_db = if config.memory_only {
-        SQLDatabase::new()
+        SQLDatabase::with_options(sql_options)
     } else {
-        SQLDatabase::open(&config.data_dir).unwrap_or_else(|_| SQLDatabase::new())
+        SQLDatabase::open_with_options(&config.data_dir, sql_options.clone())
+            .unwrap_or_else(|_| SQLDatabase::with_options(sql_options))
     };
 
     let auth_msg = if config.auth_required() {
@@ -703,13 +804,16 @@ pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error
 
     let wire_port = config.wire_port;
     let addr = format!("{}:{}", config.host, config.port);
-    println!("🦀 RustyDB REST API Server v0.2.0");
+    println!("🦀 RustyDB REST API Server v0.3.0-beta");
     println!("=================================");
     println!("  HTTP API:  http://{}", addr);
     println!("  MySQL Wire: {}:{}", config.host, wire_port);
     println!("  Auth:      {}", auth_msg);
     println!("  Data dir:  {}", config.data_dir);
-    println!("  Memory:    {}", if config.memory_only { "YES" } else { "NO" });
+    println!(
+        "  Memory:    {}",
+        if config.memory_only { "YES" } else { "NO" }
+    );
     println!();
     println!("HTTP Endpoints:");
     println!("  GET    /health           - Health check");
@@ -729,9 +833,18 @@ pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error
     println!();
     println!("MySQL Wire Protocol:");
     println!("  Connect with any MySQL client on port {}", wire_port);
-    println!("  Example: mysql -h 127.0.0.1 -P {} -u <user> -p", wire_port);
-    println!("  Python:  mysql.connector.connect(host='127.0.0.1', port={}, ...)", wire_port);
-    println!("  Rust:    mysql::Conn::new(\"mysql://user:pass@127.0.0.1:{}/rustydb\")", wire_port);
+    println!(
+        "  Example: mysql -h 127.0.0.1 -P {} -u <user> -p",
+        wire_port
+    );
+    println!(
+        "  Python:  mysql.connector.connect(host='127.0.0.1', port={}, ...)",
+        wire_port
+    );
+    println!(
+        "  Rust:    mysql::Conn::new(\"mysql://user:pass@127.0.0.1:{}/rustydb\")",
+        wire_port
+    );
     println!();
 
     let state = Arc::new(AppState {

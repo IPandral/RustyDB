@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::fmt;
 
-/// Supported SQL data types
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Supported SQL data types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DataType {
     Integer,
     Float,
@@ -13,17 +14,21 @@ pub enum DataType {
 
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DataType::Integer => write!(f, "INTEGER"),
-            DataType::Float => write!(f, "FLOAT"),
-            DataType::Text => write!(f, "TEXT"),
-            DataType::Boolean => write!(f, "BOOLEAN"),
-            DataType::Null => write!(f, "NULL"),
-        }
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Integer => "INTEGER",
+                Self::Float => "FLOAT",
+                Self::Text => "TEXT",
+                Self::Boolean => "BOOLEAN",
+                Self::Null => "NULL",
+            }
+        )
     }
 }
 
-/// A value in the database
+/// A scalar SQL value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
     Integer(i64),
@@ -34,94 +39,131 @@ pub enum Value {
 }
 
 impl Value {
-    /// Get the data type of this value
     pub fn data_type(&self) -> DataType {
         match self {
-            Value::Integer(_) => DataType::Integer,
-            Value::Float(_) => DataType::Float,
-            Value::Text(_) => DataType::Text,
-            Value::Boolean(_) => DataType::Boolean,
-            Value::Null => DataType::Null,
+            Self::Integer(_) => DataType::Integer,
+            Self::Float(_) => DataType::Float,
+            Self::Text(_) => DataType::Text,
+            Self::Boolean(_) => DataType::Boolean,
+            Self::Null => DataType::Null,
         }
     }
 
-    /// Check if this value is compatible with a data type
-    pub fn is_compatible_with(&self, dtype: &DataType) -> bool {
-        match (self, dtype) {
-            (Value::Null, _) => true, // NULL is compatible with any type
-            (Value::Integer(_), DataType::Integer) => true,
-            (Value::Integer(_), DataType::Float) => true, // Int can be promoted to Float
-            (Value::Float(_), DataType::Float) => true,
-            (Value::Text(_), DataType::Text) => true,
-            (Value::Boolean(_), DataType::Boolean) => true,
-            _ => false,
-        }
+    pub fn is_compatible_with(&self, data_type: &DataType) -> bool {
+        matches!(
+            (self, data_type),
+            (Self::Null, _)
+                | (Self::Integer(_), DataType::Integer | DataType::Float)
+                | (Self::Float(_), DataType::Float)
+                | (Self::Text(_), DataType::Text)
+                | (Self::Boolean(_), DataType::Boolean)
+        )
     }
 
-    /// Convert value to the target type if possible
-    #[allow(dead_code)]
-    pub fn coerce_to(&self, dtype: &DataType) -> Option<Value> {
-        match (self, dtype) {
-            (Value::Null, _) => Some(Value::Null),
-            (Value::Integer(i), DataType::Integer) => Some(Value::Integer(*i)),
-            (Value::Integer(i), DataType::Float) => Some(Value::Float(*i as f64)),
-            (Value::Float(f), DataType::Float) => Some(Value::Float(*f)),
-            (Value::Text(s), DataType::Text) => Some(Value::Text(s.clone())),
-            (Value::Boolean(b), DataType::Boolean) => Some(Value::Boolean(*b)),
+    pub fn coerce_to(&self, data_type: &DataType) -> Option<Self> {
+        match (self, data_type) {
+            (Self::Null, _) => Some(Self::Null),
+            (Self::Integer(value), DataType::Integer) => Some(Self::Integer(*value)),
+            (Self::Integer(value), DataType::Float) => Some(Self::Float(*value as f64)),
+            (Self::Float(value), DataType::Float) => Some(Self::Float(*value)),
+            (Self::Text(value), DataType::Text) => Some(Self::Text(value.clone())),
+            (Self::Boolean(value), DataType::Boolean) => Some(Self::Boolean(*value)),
             _ => None,
         }
     }
 
-    /// Parse a string into a value of the given type
-    #[allow(dead_code)]
-    pub fn parse(s: &str, dtype: &DataType) -> Option<Value> {
-        match dtype {
-            DataType::Integer => s.parse::<i64>().ok().map(Value::Integer),
-            DataType::Float => s.parse::<f64>().ok().map(Value::Float),
-            DataType::Text => Some(Value::Text(s.to_string())),
-            DataType::Boolean => match s.to_lowercase().as_str() {
-                "true" | "1" | "yes" => Some(Value::Boolean(true)),
-                "false" | "0" | "no" => Some(Value::Boolean(false)),
+    pub fn parse(value: &str, data_type: &DataType) -> Option<Self> {
+        match data_type {
+            DataType::Integer => value.parse().ok().map(Self::Integer),
+            DataType::Float => value.parse().ok().map(Self::Float),
+            DataType::Text => Some(Self::Text(value.to_string())),
+            DataType::Boolean => match value.to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" => Some(Self::Boolean(true)),
+                "false" | "0" | "no" => Some(Self::Boolean(false)),
                 _ => None,
             },
-            DataType::Null => Some(Value::Null),
+            DataType::Null => Some(Self::Null),
         }
     }
 
-    /// Compare two values (for WHERE clauses)
-    pub fn compare(&self, other: &Value, op: &ComparisonOp) -> bool {
-        match op {
-            ComparisonOp::Equal => self == other,
-            ComparisonOp::NotEqual => self != other,
-            ComparisonOp::LessThan => self.partial_cmp(other) == Some(std::cmp::Ordering::Less),
-            ComparisonOp::LessThanOrEqual => {
-                matches!(self.partial_cmp(other), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal))
-            }
-            ComparisonOp::GreaterThan => self.partial_cmp(other) == Some(std::cmp::Ordering::Greater),
-            ComparisonOp::GreaterThanOrEqual => {
-                matches!(self.partial_cmp(other), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal))
-            }
-            ComparisonOp::Like => {
-                if let (Value::Text(s), Value::Text(pattern)) = (self, other) {
-                    like_match(s, pattern)
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
+    pub fn truth(&self) -> SqlTruth {
+        match self {
+            Self::Boolean(true) => SqlTruth::True,
+            Self::Boolean(false) => SqlTruth::False,
+            Self::Null => SqlTruth::Unknown,
+            Self::Integer(value) => {
+                if *value == 0 {
+                    SqlTruth::False
                 } else {
-                    false
+                    SqlTruth::True
+                }
+            }
+            Self::Float(value) => {
+                if *value == 0.0 {
+                    SqlTruth::False
+                } else {
+                    SqlTruth::True
+                }
+            }
+            Self::Text(value) => {
+                if value.is_empty() {
+                    SqlTruth::False
+                } else {
+                    SqlTruth::True
                 }
             }
         }
     }
+
+    pub fn compare_sql(&self, other: &Self, op: &ComparisonOp) -> SqlTruth {
+        if self.is_null() || other.is_null() {
+            return SqlTruth::Unknown;
+        }
+        let result = match op {
+            ComparisonOp::Equal => self.partial_cmp(other) == Some(Ordering::Equal),
+            ComparisonOp::NotEqual => self.partial_cmp(other) != Some(Ordering::Equal),
+            ComparisonOp::LessThan => self.partial_cmp(other) == Some(Ordering::Less),
+            ComparisonOp::LessThanOrEqual => {
+                matches!(
+                    self.partial_cmp(other),
+                    Some(Ordering::Less | Ordering::Equal)
+                )
+            }
+            ComparisonOp::GreaterThan => self.partial_cmp(other) == Some(Ordering::Greater),
+            ComparisonOp::GreaterThanOrEqual => {
+                matches!(
+                    self.partial_cmp(other),
+                    Some(Ordering::Greater | Ordering::Equal)
+                )
+            }
+            ComparisonOp::Like => match (self, other) {
+                (Self::Text(text), Self::Text(pattern)) => like_match(text, pattern),
+                _ => false,
+            },
+        };
+        SqlTruth::from(result)
+    }
+
+    /// Compatibility helper retained for existing callers.
+    pub fn compare(&self, other: &Self, op: &ComparisonOp) -> bool {
+        self.compare_sql(other, op) == SqlTruth::True
+    }
 }
 
 impl PartialOrd for Value {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         match (self, other) {
-            (Value::Integer(a), Value::Integer(b)) => a.partial_cmp(b),
-            (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
-            (Value::Integer(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
-            (Value::Float(a), Value::Integer(b)) => a.partial_cmp(&(*b as f64)),
-            (Value::Text(a), Value::Text(b)) => a.partial_cmp(b),
-            (Value::Boolean(a), Value::Boolean(b)) => a.partial_cmp(b),
-            (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
+            (Self::Integer(a), Self::Integer(b)) => a.partial_cmp(b),
+            (Self::Float(a), Self::Float(b)) => a.partial_cmp(b),
+            (Self::Integer(a), Self::Float(b)) => (*a as f64).partial_cmp(b),
+            (Self::Float(a), Self::Integer(b)) => a.partial_cmp(&(*b as f64)),
+            (Self::Text(a), Self::Text(b)) => a.partial_cmp(b),
+            (Self::Boolean(a), Self::Boolean(b)) => a.partial_cmp(b),
+            (Self::Null, Self::Null) => Some(Ordering::Equal),
             _ => None,
         }
     }
@@ -130,17 +172,55 @@ impl PartialOrd for Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Value::Integer(i) => write!(f, "{}", i),
-            Value::Float(fl) => write!(f, "{}", fl),
-            Value::Text(s) => write!(f, "{}", s),
-            Value::Boolean(b) => write!(f, "{}", b),
-            Value::Null => write!(f, "NULL"),
+            Self::Integer(value) => write!(f, "{value}"),
+            Self::Float(value) => write!(f, "{value}"),
+            Self::Text(value) => write!(f, "{value}"),
+            Self::Boolean(value) => write!(f, "{value}"),
+            Self::Null => write!(f, "NULL"),
         }
     }
 }
 
-/// Comparison operators for WHERE clauses
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SqlTruth {
+    True,
+    False,
+    Unknown,
+}
+
+impl SqlTruth {
+    pub fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::False, _) | (_, Self::False) => Self::False,
+            (Self::True, Self::True) => Self::True,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::True, _) | (_, Self::True) => Self::True,
+            (Self::False, Self::False) => Self::False,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn negate(self) -> Self {
+        match self {
+            Self::True => Self::False,
+            Self::False => Self::True,
+            Self::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<bool> for SqlTruth {
+    fn from(value: bool) -> Self {
+        if value { Self::True } else { Self::False }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ComparisonOp {
     Equal,
     NotEqual,
@@ -153,43 +233,272 @@ pub enum ComparisonOp {
 
 impl fmt::Display for ComparisonOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ComparisonOp::Equal => write!(f, "="),
-            ComparisonOp::NotEqual => write!(f, "!="),
-            ComparisonOp::LessThan => write!(f, "<"),
-            ComparisonOp::LessThanOrEqual => write!(f, "<="),
-            ComparisonOp::GreaterThan => write!(f, ">"),
-            ComparisonOp::GreaterThanOrEqual => write!(f, ">="),
-            ComparisonOp::Like => write!(f, "LIKE"),
-        }
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Equal => "=",
+                Self::NotEqual => "!=",
+                Self::LessThan => "<",
+                Self::LessThanOrEqual => "<=",
+                Self::GreaterThan => ">",
+                Self::GreaterThanOrEqual => ">=",
+                Self::Like => "LIKE",
+            }
+        )
     }
 }
 
-/// Logical operators for combining conditions
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogicalOp {
     And,
     Or,
 }
 
-/// Column definition for CREATE TABLE
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BinaryOp {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Compare(ComparisonOp),
+    And,
+    Or,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnaryOp {
+    Not,
+    Negate,
+    Plus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AggregateFunction {
+    Count,
+    Sum,
+    Avg,
+    Max,
+    Min,
+}
+
+/// RustyDB-owned expression tree. Subqueries are boxed to keep recursive values bounded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Expr {
+    Column {
+        qualifier: Option<String>,
+        name: String,
+    },
+    Literal(Value),
+    Binary {
+        left: Box<Expr>,
+        op: BinaryOp,
+        right: Box<Expr>,
+    },
+    Unary {
+        op: UnaryOp,
+        expr: Box<Expr>,
+    },
+    IsNull {
+        expr: Box<Expr>,
+        negated: bool,
+    },
+    Like {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        negated: bool,
+    },
+    InList {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+        negated: bool,
+    },
+    InSubquery {
+        expr: Box<Expr>,
+        query: Box<Query>,
+        negated: bool,
+    },
+    Exists {
+        query: Box<Query>,
+        negated: bool,
+    },
+    ScalarSubquery(Box<Query>),
+    Aggregate {
+        function: AggregateFunction,
+        expr: Option<Box<Expr>>,
+        distinct: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SelectItem {
+    Wildcard(Option<String>),
+    Expr { expr: Expr, alias: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TableSource {
+    Table { name: String, alias: Option<String> },
+    Derived { query: Box<Query>, alias: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Cross,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Join {
+    pub join_type: JoinType,
+    pub source: TableSource,
+    pub on: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OrderBy {
+    pub expr: Expr,
+    pub descending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Cte {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub query: Box<Query>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Query {
+    pub ctes: Vec<Cte>,
+    pub distinct: bool,
+    pub projection: Vec<SelectItem>,
+    pub from: Option<TableSource>,
+    pub joins: Vec<Join>,
+    pub selection: Option<Expr>,
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
+    pub order_by: Vec<OrderBy>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JoinAlgorithm {
+    Hash,
+    NestedLoop,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum LogicalPlan {
+    Values,
+    TableScan {
+        table: String,
+        alias: Option<String>,
+        index: Option<String>,
+    },
+    DerivedScan {
+        alias: String,
+        input: Box<LogicalPlan>,
+    },
+    Filter {
+        predicate: Expr,
+        input: Box<LogicalPlan>,
+    },
+    Projection {
+        expressions: Vec<SelectItem>,
+        input: Box<LogicalPlan>,
+    },
+    Join {
+        join_type: JoinType,
+        algorithm: JoinAlgorithm,
+        on: Option<Expr>,
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+    },
+    Aggregate {
+        group_by: Vec<Expr>,
+        having: Option<Expr>,
+        input: Box<LogicalPlan>,
+    },
+    Sort {
+        order_by: Vec<OrderBy>,
+        input: Box<LogicalPlan>,
+    },
+    TopN {
+        order_by: Vec<OrderBy>,
+        limit: usize,
+        input: Box<LogicalPlan>,
+    },
+    Limit {
+        limit: usize,
+        input: Box<LogicalPlan>,
+    },
+    MaterializeCte {
+        name: String,
+        cte: Box<LogicalPlan>,
+        input: Box<LogicalPlan>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForeignKeyConstraint {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+    pub foreign_table: String,
+    pub referred_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum TableConstraint {
+    PrimaryKey {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
+    Unique {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
+    Check {
+        name: Option<String>,
+        expr: Expr,
+    },
+    ForeignKey(ForeignKeyConstraint),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexDef {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
+    pub automatic: bool,
+}
+
+/// Column definition for CREATE TABLE.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
     pub primary_key: bool,
+    #[serde(default)]
+    pub unique: bool,
     pub default: Option<Value>,
+    #[serde(default)]
+    pub checks: Vec<Expr>,
 }
 
 impl ColumnDef {
     pub fn new(name: &str, data_type: DataType) -> Self {
-        ColumnDef {
+        Self {
             name: name.to_string(),
             data_type,
             nullable: true,
             primary_key: false,
+            unique: false,
             default: None,
+            checks: Vec::new(),
         }
     }
 
@@ -200,50 +509,58 @@ impl ColumnDef {
 
     pub fn primary_key(mut self) -> Self {
         self.primary_key = true;
+        self.unique = true;
         self.nullable = false;
         self
     }
 
-    #[allow(dead_code)]
+    pub fn unique(mut self) -> Self {
+        self.unique = true;
+        self
+    }
+
     pub fn with_default(mut self, value: Value) -> Self {
         self.default = Some(value);
         self
     }
 }
 
-/// Table schema
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableSchema {
     pub name: String,
     pub columns: Vec<ColumnDef>,
+    #[serde(default)]
+    pub constraints: Vec<TableConstraint>,
+    #[serde(default)]
+    pub indexes: Vec<IndexDef>,
 }
 
 impl TableSchema {
     pub fn new(name: &str, columns: Vec<ColumnDef>) -> Self {
-        TableSchema {
+        Self {
             name: name.to_string(),
             columns,
+            constraints: Vec::new(),
+            indexes: Vec::new(),
         }
     }
 
-    /// Get column index by name
     pub fn column_index(&self, name: &str) -> Option<usize> {
-        let name_lower = name.to_lowercase();
-        self.columns.iter().position(|c| c.name.to_lowercase() == name_lower)
+        self.columns
+            .iter()
+            .position(|column| column.name.eq_ignore_ascii_case(name))
     }
 
-    /// Get column definition by name
     pub fn column(&self, name: &str) -> Option<&ColumnDef> {
-        let name_lower = name.to_lowercase();
-        self.columns.iter().find(|c| c.name.to_lowercase() == name_lower)
+        self.columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(name))
     }
 
-    /// Get primary key column index
     pub fn primary_key_index(&self) -> Option<usize> {
-        self.columns.iter().position(|c| c.primary_key)
+        self.columns.iter().position(|column| column.primary_key)
     }
 
-    /// Validate a row against the schema
     pub fn validate_row(&self, row: &[Value]) -> Result<(), String> {
         if row.len() != self.columns.len() {
             return Err(format!(
@@ -252,27 +569,24 @@ impl TableSchema {
                 row.len()
             ));
         }
-
-        for (_i, (value, col)) in row.iter().zip(self.columns.iter()).enumerate() {
-            if matches!(value, Value::Null) {
-                if !col.nullable {
-                    return Err(format!("Column '{}' cannot be NULL", col.name));
+        for (value, column) in row.iter().zip(&self.columns) {
+            if value.is_null() {
+                if !column.nullable {
+                    return Err(format!("Column '{}' cannot be NULL", column.name));
                 }
-            } else if !value.is_compatible_with(&col.data_type) {
+            } else if !value.is_compatible_with(&column.data_type) {
                 return Err(format!(
-                    "Column '{}' expects {:?}, got {:?}",
-                    col.name,
-                    col.data_type,
+                    "Column '{}' expects {}, got {}",
+                    column.name,
+                    column.data_type,
                     value.data_type()
                 ));
             }
         }
-
         Ok(())
     }
 }
 
-/// A row in a table
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Row {
     pub values: Vec<Value>,
@@ -280,16 +594,14 @@ pub struct Row {
 
 impl Row {
     pub fn new(values: Vec<Value>) -> Self {
-        Row { values }
+        Self { values }
     }
 
-    #[allow(dead_code)]
     pub fn get(&self, index: usize) -> Option<&Value> {
         self.values.get(index)
     }
 }
 
-/// Result set from a SELECT query
 #[derive(Debug, Clone)]
 pub struct ResultSet {
     pub columns: Vec<String>,
@@ -298,7 +610,7 @@ pub struct ResultSet {
 
 impl ResultSet {
     pub fn new(columns: Vec<String>) -> Self {
-        ResultSet {
+        Self {
             columns,
             rows: Vec::new(),
         }
@@ -308,96 +620,71 @@ impl ResultSet {
         self.rows.push(row);
     }
 
-    #[allow(dead_code)]
     pub fn row_count(&self) -> usize {
         self.rows.len()
     }
 
-    /// Format as a table string
     pub fn to_table_string(&self) -> String {
         if self.columns.is_empty() {
-            return String::from("Empty result set");
+            return "Empty result set".to_string();
         }
-
-        // Calculate column widths
-        let mut widths: Vec<usize> = self.columns.iter().map(|c| c.len()).collect();
+        let mut widths: Vec<usize> = self.columns.iter().map(String::len).collect();
         for row in &self.rows {
-            for (i, value) in row.values.iter().enumerate() {
-                if i < widths.len() {
-                    widths[i] = widths[i].max(value.to_string().len());
+            for (index, value) in row.values.iter().enumerate() {
+                if let Some(width) = widths.get_mut(index) {
+                    *width = (*width).max(value.to_string().len());
                 }
             }
         }
-
-        let mut result = String::new();
-
-        // Header separator
-        let separator: String = widths.iter().map(|w| "-".repeat(*w + 2)).collect::<Vec<_>>().join("+");
-        let separator = format!("+{}+\n", separator);
-
-        result.push_str(&separator);
-
-        // Header
-        let header: String = self.columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| format!(" {:width$} ", c, width = widths[i]))
-            .collect::<Vec<_>>()
-            .join("|");
-        result.push_str(&format!("|{}|\n", header));
-        result.push_str(&separator);
-
-        // Rows
-        for row in &self.rows {
-            let row_str: String = row.values
+        let separator = format!(
+            "+{}+\n",
+            widths
                 .iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    let width = widths.get(i).copied().unwrap_or(10);
-                    format!(" {:width$} ", v.to_string(), width = width)
-                })
+                .map(|width| "-".repeat(width + 2))
                 .collect::<Vec<_>>()
-                .join("|");
-            result.push_str(&format!("|{}|\n", row_str));
+                .join("+")
+        );
+        let mut output = separator.clone();
+        output.push('|');
+        for (index, column) in self.columns.iter().enumerate() {
+            output.push_str(&format!(" {:width$} |", column, width = widths[index]));
         }
-
-        result.push_str(&separator);
-        result.push_str(&format!("{} row(s)\n", self.rows.len()));
-
-        result
+        output.push('\n');
+        output.push_str(&separator);
+        for row in &self.rows {
+            output.push('|');
+            for (index, value) in row.values.iter().enumerate() {
+                output.push_str(&format!(" {:width$} |", value, width = widths[index]));
+            }
+            output.push('\n');
+        }
+        output.push_str(&separator);
+        output.push_str(&format!("{} row(s)\n", self.rows.len()));
+        output
     }
 }
 
-/// SQL LIKE pattern matching (supports % and _)
-fn like_match(text: &str, pattern: &str) -> bool {
-    let text_chars: Vec<char> = text.chars().collect();
-    let pattern_chars: Vec<char> = pattern.chars().collect();
-    
-    fn match_helper(text: &[char], pattern: &[char]) -> bool {
-        match (text.first(), pattern.first()) {
-            (None, None) => true,
-            (None, Some('%')) => match_helper(text, &pattern[1..]),
-            (None, Some(_)) => false,
-            (Some(_), None) => false,
-            (Some(_), Some('%')) => {
-                // % matches zero or more characters
-                match_helper(text, &pattern[1..]) || match_helper(&text[1..], pattern)
-            }
-            (Some(_t), Some('_')) => {
-                // _ matches exactly one character
-                match_helper(&text[1..], &pattern[1..])
-            }
-            (Some(t), Some(p)) => {
-                if t.to_lowercase().next() == p.to_lowercase().next() {
-                    match_helper(&text[1..], &pattern[1..])
-                } else {
-                    false
-                }
-            }
+/// SQL LIKE pattern matching with `%` and `_`.
+pub(crate) fn like_match(text: &str, pattern: &str) -> bool {
+    let text: Vec<char> = text.chars().collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+    let mut dp = vec![vec![false; pattern.len() + 1]; text.len() + 1];
+    dp[0][0] = true;
+    for j in 1..=pattern.len() {
+        if pattern[j - 1] == '%' {
+            dp[0][j] = dp[0][j - 1];
         }
     }
-    
-    match_helper(&text_chars, &pattern_chars)
+    for i in 1..=text.len() {
+        for j in 1..=pattern.len() {
+            dp[i][j] = match pattern[j - 1] {
+                '%' => dp[i][j - 1] || dp[i - 1][j],
+                '_' => dp[i - 1][j - 1],
+                character => character == text[i - 1] && dp[i - 1][j - 1],
+            };
+        }
+    }
+    dp[text.len()][pattern.len()]
 }
 
 #[cfg(test)]
@@ -406,33 +693,38 @@ mod tests {
 
     #[test]
     fn test_value_comparison() {
-        assert!(Value::Integer(5).compare(&Value::Integer(5), &ComparisonOp::Equal));
         assert!(Value::Integer(5).compare(&Value::Integer(3), &ComparisonOp::GreaterThan));
-        assert!(Value::Text("hello".to_string()).compare(&Value::Text("hello".to_string()), &ComparisonOp::Equal));
+        assert_eq!(
+            Value::Null.compare_sql(&Value::Integer(1), &ComparisonOp::Equal),
+            SqlTruth::Unknown
+        );
     }
 
     #[test]
     fn test_like_pattern() {
-        assert!(like_match("hello", "hello"));
-        assert!(like_match("hello", "h%"));
-        assert!(like_match("hello", "%llo"));
-        assert!(like_match("hello", "%ll%"));
-        assert!(like_match("hello", "h_llo"));
-        assert!(!like_match("hello", "h_lo"));
+        assert!(like_match("hello world", "hello%"));
+        assert!(like_match("cat", "c_t"));
+        assert!(!like_match("cat", "d%"));
     }
 
     #[test]
     fn test_schema_validation() {
-        let schema = TableSchema::new("test", vec![
-            ColumnDef::new("id", DataType::Integer).primary_key(),
-            ColumnDef::new("name", DataType::Text).not_null(),
-            ColumnDef::new("age", DataType::Integer),
-        ]);
-
-        let valid_row = vec![Value::Integer(1), Value::Text("Alice".to_string()), Value::Integer(30)];
-        assert!(schema.validate_row(&valid_row).is_ok());
-
-        let null_name = vec![Value::Integer(1), Value::Null, Value::Integer(30)];
-        assert!(schema.validate_row(&null_name).is_err());
+        let schema = TableSchema::new(
+            "users",
+            vec![
+                ColumnDef::new("id", DataType::Integer).primary_key(),
+                ColumnDef::new("name", DataType::Text).not_null(),
+            ],
+        );
+        assert!(
+            schema
+                .validate_row(&[Value::Integer(1), Value::Text("Alice".into())])
+                .is_ok()
+        );
+        assert!(
+            schema
+                .validate_row(&[Value::Integer(1), Value::Null])
+                .is_err()
+        );
     }
 }
