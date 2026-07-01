@@ -29,18 +29,15 @@ pub fn print_outdated_version_warning() {
         return;
     }
 
-    match check_for_update() {
-        Ok(Some(update)) => {
-            println!(
-                "WARNING: RustyDB {} is outdated. Latest available package version is {}.",
-                update.current_version, update.latest_version
-            );
-            println!(
-                "         Update from: https://github.com/IPandral/RustyDB/pkgs/container/rustydb"
-            );
-            println!();
-        }
-        Ok(None) | Err(_) => {}
+    if let Ok(Some(update)) = check_for_update() {
+        println!(
+            "WARNING: RustyDB {} is outdated. Latest available package version is {}.",
+            update.current_version, update.latest_version
+        );
+        println!(
+            "         Update from: https://github.com/IPandral/RustyDB/pkgs/container/rustydb"
+        );
+        println!();
     }
 }
 
