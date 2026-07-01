@@ -14,6 +14,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::kvstore::KVStore;
 use crate::sql::{ExecutionResult, SQLDatabase, SQLDatabaseOptions};
+use crate::{RUSTYDB_VERSION, print_outdated_version_warning};
 
 fn parse_bloom_false_positive_rate(value: Option<String>) -> f64 {
     value
@@ -738,7 +739,7 @@ async fn health_check() -> impl IntoResponse {
         StatusCode::OK,
         Json(ApiResponse::success(serde_json::json!({
             "status": "healthy",
-            "version": "0.3.0-beta"
+            "version": RUSTYDB_VERSION
         }))),
     )
 }
@@ -810,8 +811,9 @@ pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error
 
     let wire_port = config.wire_port;
     let addr = format!("{}:{}", config.host, config.port);
-    println!("🦀 RustyDB REST API Server v0.3.0-beta");
+    println!("RustyDB REST API Server v{}", RUSTYDB_VERSION);
     println!("=================================");
+    print_outdated_version_warning();
     println!("  HTTP API:  http://{}", addr);
     println!("  MySQL Wire: {}:{}", config.host, wire_port);
     println!("  Auth:      {}", auth_msg);
