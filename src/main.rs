@@ -1,4 +1,4 @@
-use rustydb::{KVStore, SQLDatabase};
+use rustydb::{KVStore, RUSTYDB_VERSION, SQLDatabase, print_outdated_version_warning};
 use std::env;
 use std::io::{self, Write};
 
@@ -27,9 +27,10 @@ fn main() {
         return;
     }
 
-    println!("RustyDB v0.3.0-beta");
+    println!("RustyDB v{}", RUSTYDB_VERSION);
     println!("A high-performance database with KV and SQL support");
     println!("Type 'help' for available commands\n");
+    print_outdated_version_warning();
 
     if use_sql_mode {
         run_sql_mode(data_dir, use_memory_only);

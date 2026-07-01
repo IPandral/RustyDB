@@ -1,6 +1,7 @@
 mod kvstore;
 mod persistence;
 pub mod sql;
+mod version_check;
 
 #[cfg(feature = "server")]
 pub mod server;
@@ -18,6 +19,9 @@ pub use sql::{
     SessionTransactionState,
 };
 pub use sql::{LogicalPlan, Optimizer, Planner};
+pub use version_check::print_outdated_version_warning;
+
+pub const RUSTYDB_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(feature = "server")]
 pub use server::{AppState, ServerConfig, create_router, start_server};
