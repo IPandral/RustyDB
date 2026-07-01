@@ -666,6 +666,8 @@ impl ResultSet {
 
 /// SQL LIKE pattern matching with `%` and `_`.
 pub(crate) fn like_match(text: &str, pattern: &str) -> bool {
+    let text = text.to_lowercase();
+    let pattern = pattern.to_lowercase();
     let text: Vec<char> = text.chars().collect();
     let pattern: Vec<char> = pattern.chars().collect();
     let mut dp = vec![vec![false; pattern.len() + 1]; text.len() + 1];
@@ -703,6 +705,7 @@ mod tests {
     #[test]
     fn test_like_pattern() {
         assert!(like_match("hello world", "hello%"));
+        assert!(like_match("Hello World", "hello%"));
         assert!(like_match("cat", "c_t"));
         assert!(!like_match("cat", "d%"));
     }

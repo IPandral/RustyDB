@@ -447,7 +447,7 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
                 };
 
                 let status = if session.is_in_transaction() {
-                    SERVER_STATUS_IN_TRANS
+                    SERVER_STATUS_AUTOCOMMIT | SERVER_STATUS_IN_TRANS
                 } else {
                     SERVER_STATUS_AUTOCOMMIT
                 };

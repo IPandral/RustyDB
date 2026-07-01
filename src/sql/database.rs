@@ -497,11 +497,24 @@ impl SQLDatabase {
             .wal
             .lock()
             .map_err(|_| "WAL lock poisoned".to_string())?;
-        if let Some(file) = wal.as_mut() {
-            file.set_len(0)
+        if wal.is_some() {
+            let wal_path = self.inner.config.data_dir.join("sql_wal.log");
+            let truncated = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&wal_path)
                 .map_err(|error| format!("Failed to truncate WAL: {error}"))?;
-            file.sync_all()
+            truncated
+                .sync_all()
                 .map_err(|error| format!("Failed to sync empty WAL: {error}"))?;
+            *wal = Some(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&wal_path)
+                    .map_err(|error| format!("Failed to reopen WAL: {error}"))?,
+            );
         }
         drop(catalog);
         Ok(())
@@ -641,13 +654,16 @@ impl SQLSession {
             *transaction = Some(state);
             return ExecutionResult::Error(format!("WAL error: {error}"));
         }
+        let schema_changed = state.schema_changed;
         *catalog = state.catalog;
-        self.database
-            .inner
-            .plan_cache
-            .lock()
-            .expect("plan cache lock poisoned")
-            .clear();
+        if schema_changed {
+            self.database
+                .inner
+                .plan_cache
+                .lock()
+                .expect("plan cache lock poisoned")
+                .clear();
+        }
         ExecutionResult::TransactionCommitted
     }
 

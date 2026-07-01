@@ -133,6 +133,28 @@ fn build_client_handshake_response(
     pkt
 }
 
+fn build_lenenc_client_handshake_response(username: &str, auth_response: &[u8]) -> Vec<u8> {
+    let caps: u32 = CLIENT_PROTOCOL_41
+        | CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
+        | CLIENT_LONG_PASSWORD
+        | CLIENT_LONG_FLAG
+        | CLIENT_TRANSACTIONS
+        | CLIENT_PLUGIN_AUTH;
+
+    let mut pkt = Vec::with_capacity(128 + auth_response.len());
+    pkt.extend_from_slice(&caps.to_le_bytes());
+    pkt.extend_from_slice(&(16_777_216u32).to_le_bytes());
+    pkt.push(CHARSET_UTF8MB4);
+    pkt.extend_from_slice(&[0u8; 23]);
+    pkt.extend_from_slice(username.as_bytes());
+    pkt.push(0);
+    pkt.extend_from_slice(&encode_lenenc_int(auth_response.len() as u64));
+    pkt.extend_from_slice(auth_response);
+    pkt.extend_from_slice(b"mysql_native_password");
+    pkt.push(0);
+    pkt
+}
+
 fn compute_auth_token(password: &str, scramble: &[u8]) -> Vec<u8> {
     use sha1::{Digest, Sha1};
 
@@ -540,6 +562,17 @@ fn test_parse_client_handshake_empty_auth() {
 
     assert_eq!(parsed.username, "anon");
     assert!(parsed.auth_response.is_empty());
+}
+
+#[test]
+fn test_parse_client_handshake_lenenc_auth() {
+    let auth_response = vec![0xCC; 300];
+    let response = build_lenenc_client_handshake_response("lenenc", &auth_response);
+    let parsed = parse_client_handshake(&response).expect("parse should succeed");
+
+    assert_eq!(parsed.username, "lenenc");
+    assert_eq!(parsed.auth_response, auth_response);
+    assert_eq!(parsed.auth_plugin.as_deref(), Some("mysql_native_password"));
 }
 
 #[test]

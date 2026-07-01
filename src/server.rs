@@ -15,6 +15,13 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::kvstore::KVStore;
 use crate::sql::{ExecutionResult, SQLDatabase, SQLDatabaseOptions};
 
+fn parse_bloom_false_positive_rate(value: Option<String>) -> f64 {
+    value
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0 && *value < 1.0)
+        .unwrap_or(0.01)
+}
+
 /// Server configuration from environment variables
 pub struct ServerConfig {
     pub host: String,
@@ -56,10 +63,9 @@ impl ServerConfig {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(32),
-            bloom_false_positive_rate: env::var("RUSTYDB_BLOOM_FALSE_POSITIVE_RATE")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(0.01),
+            bloom_false_positive_rate: parse_bloom_false_positive_rate(
+                env::var("RUSTYDB_BLOOM_FALSE_POSITIVE_RATE").ok(),
+            ),
         }
     }
 
@@ -869,4 +875,27 @@ pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bloom_false_positive_rate;
+
+    #[test]
+    fn rejects_invalid_bloom_false_positive_rates() {
+        for value in ["-1", "0", "1", "2", "NaN", "inf"] {
+            assert_eq!(
+                parse_bloom_false_positive_rate(Some(value.to_string())),
+                0.01
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_valid_bloom_false_positive_rate() {
+        assert_eq!(
+            parse_bloom_false_positive_rate(Some("0.05".to_string())),
+            0.05
+        );
+    }
 }

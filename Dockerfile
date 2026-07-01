@@ -28,7 +28,7 @@ RUN mkdir src && \
 
 # Build dependencies (this layer is cached)
 RUN cargo build --release --features server 2>/dev/null || true && \
-    rm -rf src benches target/release/deps/rustydb*
+    rm -rf src benches target/release/rustydb target/release/deps/*rustydb*
 
 # Copy actual source code and benches (benches are referenced in Cargo.toml)
 COPY src ./src

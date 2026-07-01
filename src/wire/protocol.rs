@@ -102,6 +102,53 @@ pub fn read_null_terminated(data: &[u8], pos: &mut usize) -> String {
     s
 }
 
+fn read_lenenc_int(data: &[u8], pos: &mut usize) -> Option<u64> {
+    if *pos >= data.len() {
+        return None;
+    }
+
+    let first = data[*pos];
+    *pos += 1;
+    match first {
+        0xFC => {
+            if data.len().saturating_sub(*pos) < 2 {
+                return None;
+            }
+            let value = u16::from_le_bytes([data[*pos], data[*pos + 1]]) as u64;
+            *pos += 2;
+            Some(value)
+        }
+        0xFD => {
+            if data.len().saturating_sub(*pos) < 3 {
+                return None;
+            }
+            let value = (data[*pos] as u64)
+                | ((data[*pos + 1] as u64) << 8)
+                | ((data[*pos + 2] as u64) << 16);
+            *pos += 3;
+            Some(value)
+        }
+        0xFE => {
+            if data.len().saturating_sub(*pos) < 8 {
+                return None;
+            }
+            let value = u64::from_le_bytes([
+                data[*pos],
+                data[*pos + 1],
+                data[*pos + 2],
+                data[*pos + 3],
+                data[*pos + 4],
+                data[*pos + 5],
+                data[*pos + 6],
+                data[*pos + 7],
+            ]);
+            *pos += 8;
+            Some(value)
+        }
+        value => Some(value as u64),
+    }
+}
+
 // ============================================================================
 // Scramble Generation
 // ============================================================================
@@ -404,29 +451,39 @@ pub fn parse_client_handshake(data: &[u8]) -> Result<ClientHandshake, String> {
     let username = read_null_terminated(data, &mut pos);
 
     // Auth response
-    let auth_response =
-        if capabilities & (CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA | CLIENT_SECURE_CONNECTION) != 0 {
-            if pos >= data.len() {
-                Vec::new()
-            } else {
-                let len = data[pos] as usize;
-                pos += 1;
-                let end = (pos + len).min(data.len());
-                let auth = data[pos..end].to_vec();
-                pos = end;
-                auth
-            }
-        } else {
-            let start = pos;
-            while pos < data.len() && data[pos] != 0 {
-                pos += 1;
-            }
-            let auth = data[start..pos].to_vec();
-            if pos < data.len() {
-                pos += 1;
-            }
-            auth
+    let auth_response = if capabilities & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
+        let Some(len) = read_lenenc_int(data, &mut pos) else {
+            return Err("Invalid length-encoded auth response".to_string());
         };
+        let len = len as usize;
+        if data.len().saturating_sub(pos) < len {
+            return Err("Auth response length exceeds packet size".to_string());
+        }
+        let auth = data[pos..pos + len].to_vec();
+        pos += len;
+        auth
+    } else if capabilities & CLIENT_SECURE_CONNECTION != 0 {
+        if pos >= data.len() {
+            Vec::new()
+        } else {
+            let len = data[pos] as usize;
+            pos += 1;
+            let end = (pos + len).min(data.len());
+            let auth = data[pos..end].to_vec();
+            pos = end;
+            auth
+        }
+    } else {
+        let start = pos;
+        while pos < data.len() && data[pos] != 0 {
+            pos += 1;
+        }
+        let auth = data[start..pos].to_vec();
+        if pos < data.len() {
+            pos += 1;
+        }
+        auth
+    };
 
     // Database (if CLIENT_CONNECT_WITH_DB)
     let database = if capabilities & CLIENT_CONNECT_WITH_DB != 0 && pos < data.len() {
