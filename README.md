@@ -1,6 +1,6 @@
 # RustyDB
 
-A lightweight, in-memory database written in Rust with **full SQL support**, **MySQL wire protocol compatibility**, and crash-safe persistence. RustyDB combines the simplicity of an embedded database with MySQL-compatible SQL syntax, letting you connect with any standard MySQL client.
+A lightweight, memory-first database written in Rust with a focused advanced SQL engine, MySQL wire protocol compatibility, and crash-safe persistence. RustyDB combines the simplicity of an embedded database with familiar MySQL syntax.
 
 Connect with any standard MySQL client -- `mysql` CLI, Python (`mysql-connector-python`, `PyMySQL`), Rust (`mysql`, `mysql_async`), Node.js, and more.
 
@@ -15,7 +15,7 @@ Connect with any standard MySQL client -- `mysql` CLI, Python (`mysql-connector-
 
 ## Features
 
-### Current In Beta Development (v0.2.0)
+### Current Beta Release (v0.3.0-beta)
 
 #### Key-Value Store
 - Lock-free concurrent access with DashMap
@@ -24,15 +24,27 @@ Connect with any standard MySQL client -- `mysql` CLI, Python (`mysql-connector-
 - Thread-safe concurrent reads and writes
 
 #### SQL Database Engine
-- **MySQL-compatible SQL syntax**
+- **MySQL-dialect parser** powered by `sqlparser`
 - **Full CRUD operations** (CREATE, INSERT, SELECT, UPDATE, DELETE)
-- **Advanced WHERE clauses** with AND/OR operators
-- **LIKE pattern matching** with `%` and `_` wildcards
-- **ORDER BY with ASC/DESC**
-- **LIMIT for result pagination**
+- **INNER, LEFT, and RIGHT JOIN**, with hash joins for equality predicates
+- **COUNT, SUM, AVG, MIN, MAX**, `GROUP BY`, and `HAVING`
+- **Scalar, IN, EXISTS, and derived-table subqueries**
+- **Materialized non-recursive CTEs**
+- **Composite B-tree indexes**, `CREATE/DROP INDEX`, `SHOW INDEXES`, and `EXPLAIN`
+- **Three-valued NULL logic**, qualified columns, aliases, ordering, and limits
+- **PRIMARY KEY, UNIQUE, CHECK, and RESTRICT foreign-key constraints**
+- **Optimistic serializable transactions** with `BEGIN`, `COMMIT`, and `ROLLBACK`
+- **Rule optimizer** with predicate pushdown, projection pruning, constant folding, hash-join selection, index selection, and Top-N sorting
 - **Data types**: INTEGER, FLOAT, TEXT, BOOLEAN, NULL
 - **Schema management** (SHOW TABLES, DESCRIBE)
 - **CLI SQL mode** with `--sql` flag
+
+#### Optimization
+- B-tree equality-prefix and final-column range scans
+- Per-index Bloom filters with configurable false-positive targets
+- Bounded LRU parsed/optimized-plan cache
+- Reusable bounded SQL scratch-buffer pool
+- Stable row IDs and copy-on-write catalog snapshots
 
 #### Persistence & Recovery
 - **Crash-safe persistence with WAL**
@@ -40,7 +52,9 @@ Connect with any standard MySQL client -- `mysql` CLI, Python (`mysql-connector-
 - **Automatic crash recovery**
 - **Configurable flush intervals**
 - **Snapshot compaction**
-- **Dual persistence** (KV + SQL tables)
+- **Versioned, checksummed committed-transaction SQL WAL**
+- **Atomic single-catalog snapshots**
+- **Automatic migration of legacy per-table JSON files**
 
 #### Network Interfaces
 - **MySQL Wire Protocol (TCP)** -- connect with any MySQL client on port 3307
@@ -52,14 +66,6 @@ Connect with any standard MySQL client -- `mysql` CLI, Python (`mysql-connector-
 - Key-Value REPL mode (default)
 - Interactive SQL REPL mode (`--sql`)
 - Server mode (`--server`) with HTTP + TCP
-
-### Planned
-- JOIN operations (INNER JOIN, LEFT JOIN)
-- Indexing (B-tree indexes for faster queries)
-- Aggregate functions (COUNT, SUM, AVG, MAX, MIN)
-- GROUP BY and HAVING clauses
-- Transactions with isolation levels
-- Query optimization engine
 
 ## Quick Start
 
@@ -174,7 +180,7 @@ docker run -p 8080:8080 -p 3307:3307 rustydb
 ### Key-Value Mode Usage
 
 ```
-RustyDB v0.2.0
+RustyDB v0.3.0-beta
 Running in Key-Value mode
 
 kv> SET name RustyDB
@@ -195,7 +201,7 @@ user:3: charlie
 ### SQL Mode Usage
 
 ```
-RustyDB v0.2.0
+RustyDB v0.3.0-beta
 Running in SQL mode
 
 sql> CREATE TABLE users (
@@ -386,14 +392,20 @@ Authentication uses HTTP Basic Auth when `RUSTYDB_USERNAME` and `RUSTYDB_PASSWOR
 
 ### Supported SQL
 
-- **DDL**: `CREATE TABLE`, `DROP TABLE`, `DESCRIBE`, `SHOW TABLES`
+- **DDL**: `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `DESCRIBE`, `SHOW TABLES`, `SHOW INDEXES`, `EXPLAIN`
 - **DML**: `INSERT`, `SELECT`, `UPDATE`, `DELETE`
 - **Data Types**: `INTEGER`/`INT`, `FLOAT`/`DOUBLE`, `TEXT`/`VARCHAR(n)`, `BOOLEAN`/`BOOL`, `NULL`
-- **WHERE Clauses**: `=`, `!=`, `<`, `<=`, `>`, `>=`, `LIKE`, `AND`, `OR`
+- **Queries**: qualified columns, aliases, `INNER`/`LEFT`/`RIGHT JOIN`, derived tables, non-recursive CTEs
+- **Subqueries**: uncorrelated scalar, `IN`, and `EXISTS`
+- **Aggregates**: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP BY`, `HAVING`
+- **WHERE Clauses**: `=`, `!=`, `<`, `<=`, `>`, `>=`, `LIKE`, `IN`, `IS NULL`, `AND`, `OR`
 - **Ordering**: `ORDER BY column [ASC|DESC]`
 - **Limits**: `LIMIT n`
-- **Constraints**: `PRIMARY KEY`, `NOT NULL`
+- **Transactions**: connection-local `BEGIN`, `COMMIT`, and `ROLLBACK`
+- **Constraints**: `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `CHECK`, composite `FOREIGN KEY` with `RESTRICT`
 - **Pattern Matching**: `LIKE` with `%` (any chars) and `_` (single char)
+
+Unsupported in this release: correlated/recursive subqueries, recursive CTEs, window functions, lateral/full joins, foreign-key cascades, and `ALTER TABLE` constraint changes.
 
 ### MySQL Wire Protocol
 
@@ -403,7 +415,8 @@ RustyDB implements the MySQL client/server protocol v10, allowing standard MySQL
 - **Commands**: `COM_QUERY`, `COM_PING`, `COM_QUIT`, `COM_INIT_DB`, `COM_FIELD_LIST`
 - **System queries**: `SET`, `USE`, `SELECT @@variables`, `SHOW DATABASES`, transaction control
 - **Result encoding**: Text protocol with column definitions and row data
-- **Reports as**: `5.7.99-RustyDB` (compatible with all standard MySQL clients)
+- **Transactions**: each wire connection owns an isolated SQL session
+- **Reports as**: `5.7.99-RustyDB-0.3.0-beta`
 
 ### Persistence Architecture
 
@@ -413,19 +426,18 @@ RustyDB uses a dual-persistence approach:
 - **Write-Ahead Log (WAL)**: Every write appended to `rustydb.wal` with `fsync()`
 - **Snapshots**: Compact representation in `rustydb.db` with atomic rename
 
-#### SQL Table Persistence
-- **Per-Table Storage**: Each table as JSON in `tables/tablename.json`
-- **SQL WAL**: Separate `sql_wal.log` replayed on startup for crash recovery
+#### SQL Persistence
+- **Catalog snapshot**: tables, schemas, constraints, stable row IDs, and index metadata in `catalog.json`
+- **SQL WAL**: versioned and checksummed committed-transaction records in `sql_wal.log`
+- **Legacy migration**: old `tables/*.json` files are imported when no catalog exists and are retained for safety
 
 ```
 rustydb_data/
 ├── rustydb.wal        # KV write-ahead log
 ├── rustydb.db         # KV snapshot
 ├── sql_wal.log        # SQL write-ahead log
-└── tables/            # SQL table storage
-    ├── users.json
-    ├── products.json
-    └── orders.json
+├── catalog.json       # Atomic SQL catalog snapshot
+└── tables/            # Optional retained v0.2 legacy files
 ```
 
 ## Environment Variables
@@ -439,6 +451,9 @@ rustydb_data/
 | `RUSTYDB_PASSWORD` | *(none)* | Auth password (both HTTP and wire) |
 | `RUSTYDB_DATA_DIR` | `./rustydb_data` | Data directory for persistence |
 | `RUSTYDB_MEMORY_ONLY` | `false` | Memory-only mode (no disk writes) |
+| `RUSTYDB_PLAN_CACHE_CAPACITY` | `256` | Parsed/optimized-plan LRU entries |
+| `RUSTYDB_MEMORY_POOL_CAPACITY` | `32` | Reusable SQL scratch buffers |
+| `RUSTYDB_BLOOM_FALSE_POSITIVE_RATE` | `0.01` | Per-index Bloom-filter target |
 
 ## Testing
 
@@ -477,58 +492,73 @@ cargo bench --bench stress_test_bench
 
 | Suite | Tests | Description |
 |-------|-------|-------------|
-| KV Store | 13 | Set, get, delete, batch ops, concurrency, persistence, crash recovery |
+| KV Store | 9 | Set, get, delete, batch ops, concurrency, persistence, crash recovery |
 | Persistence | 4 | WAL log/recover, snapshots, async flush, config |
-| SQL Parser | 5 | CREATE, INSERT, SELECT, UPDATE, DELETE parsing |
-| SQL Executor | 4 | Table operations, WHERE, UPDATE, DELETE |
+| SQL Parser | 3 | Constraints, advanced queries, indexes, transactions |
+| SQL Executor | 8 | CRUD, indexes, joins, aggregates, subqueries, constraints, NULL logic |
 | SQL Types | 3 | Value comparison, LIKE patterns, schema validation |
-| SQL Database | 4 | CRUD, MySQL syntax, persistence, batch execute |
-| Wire Protocol | 42 | Packet encoding, auth, handshake, TCP integration, system queries |
+| SQL Database | 5 | Autocommit, transactions, persistence, WAL recovery, legacy migration |
+| Wire Protocol | 43 | Packet encoding, auth, TCP integration, isolation, rollback, conflicts |
 
-**Total: 75 tests** (29 unit + 4 database + 42 wire integration)
+**Total: 75 tests** (32 unit/database + 43 wire integration)
 
 ## Performance
 
 ### Benchmark Environment
 
-- **macOS**: Apple M3 Pro (12 cores), 18GB unified memory
-- **MySQL 8.0**: Docker container with `tmpfs` (RAM-backed), tuned InnoDB settings
-- **RustyDB**: In-memory mode (`--memory`), MySQL wire protocol on port 3307
-- **Method**: 100 iterations, 10 warmup, single persistent connection per target
+- **Measured**: June 21, 2026
+- **Hardware**: Apple M3 Pro, 11 cores (5 performance + 6 efficiency), 18GB unified memory
+- **Build**: RustyDB `0.3.0-beta`, release profile, in-memory embedded API
+- **Method**: Criterion warmup plus 10-30 measured samples; lower is better
 
-### SQL Performance (Wire Protocol vs MySQL 8.0)
+### SQL Optimization Performance
 
-| Operation | RustyDB (ms) | MySQL (ms) | Notes |
-|-----------|-------------|-----------|-------|
-| CREATE TABLE | 6.97 | 4.81 | |
-| INSERT | 2.04 | 1.30 | |
-| SELECT * (1K rows) | 4.36 | 4.05 | |
-| SELECT WHERE = | 2.24 | 1.68 | |
-| SELECT WHERE > | 4.39 | 2.76 | |
-| SELECT WHERE AND | 2.12 | 1.49 | |
-| SELECT LIKE suffix | 3.62 | 2.18 | |
-| SELECT LIKE prefix | 2.13 | 1.27 | |
-| SELECT ORDER BY | 4.40 | 3.81 | |
-| SELECT ORDER BY LIMIT | 0.25 | 1.12 | RustyDB 4.4x faster |
-| UPDATE single row | 1.96 | 1.47 | |
-| UPDATE multi row | 2.05 | 1.28 | |
-| DELETE single row | 5.02 | 1.48 | |
-| Mixed workload | 1.45 | 1.27 | |
-| Table scan (100 rows) | 0.36 | 0.87 | RustyDB 2.4x faster |
-| Table scan (1K rows) | 4.99 | 3.88 | |
-| Table scan (10K rows) | 42.02 | 26.12 | |
-| Complex WHERE (orders) | 3.83 | 2.10 | |
-| Complex WHERE (users) | 2.50 | 1.80 | |
+| Workload | Median | p95 | Result |
+|----------|-------:|----:|--------|
+| Sequential composite range, 1K rows | 0.151 ms | 0.155 ms | baseline |
+| Indexed composite range, 1K rows | 0.015 ms | 0.015 ms | 10.0x faster |
+| Sequential composite range, 10K rows | 1.508 ms | 1.583 ms | baseline |
+| Indexed composite range, 10K rows | 0.249 ms | 0.251 ms | 6.1x faster |
+| Sequential composite range, 100K rows | 14.975 ms | 15.153 ms | baseline |
+| Indexed composite range, 100K rows | 3.407 ms | 3.526 ms | 4.4x faster |
+| Hash join + grouped aggregate | 5.766 ms | 6.072 ms | 1K users / 10K orders |
+| Materialized CTE + IN subquery | 20.381 ms | 21.417 ms | 1K users / 10K orders |
+| Serializable transaction, 10 writes | 2.915 ms | 5.299 ms | atomic commit |
+| Constraint-checked insert | 0.381 ms | 0.674 ms | PK + UNIQUE + CHECK + FK |
+| Warm plan-cache lookup | 0.0025 ms | 0.0026 ms | 4.4x faster than cold |
+| Cold plan parse/optimize | 0.0109 ms | 0.0116 ms | unique SQL text |
 
-*All times are median values in milliseconds. Lower is better.*
+### MySQL Wire Performance vs MySQL 8
 
-These benchmarks measure **end-to-end wire protocol latency** (network + parsing + execution + serialization). RustyDB's native in-process API (measured via `cargo bench`) is significantly faster since it bypasses the wire protocol overhead.
+Measured on the same Apple M3 Pro host using macOS 26.5.1 (`arm64`), Docker 27.4.0, MySQL 8.0.46 (`linux/arm64`), Python 3.12.3, and `mysql-connector-python` 9.6.0. RustyDB used its release build in memory-only mode. MySQL used the repository's benchmark configuration with a tmpfs data directory and relaxed benchmark durability.
+
+The harness first compared every workload's returned rows or affected-row count across both engines. All 22 correctness checks passed before timing. Each result below is from 10 warmups and 100 measured wire-protocol iterations on June 21, 2026; lower is better.
+
+| Workload | RustyDB median / p95 | MySQL median / p95 | Median comparison |
+|----------|---------------------:|-------------------:|------------------:|
+| CREATE TABLE | 0.288 / 0.593 ms | 4.091 / 4.740 ms | RustyDB 14.2x faster |
+| Single-row INSERT | 0.362 / 0.500 ms | 0.875 / 1.031 ms | RustyDB 2.4x faster |
+| SELECT all, 1K rows | 3.983 / 5.290 ms | 4.698 / 5.324 ms | RustyDB 1.2x faster |
+| Filtered SELECT, equality | 1.680 / 2.239 ms | 1.993 / 3.340 ms | RustyDB 1.2x faster |
+| ORDER BY + LIMIT | 0.385 / 0.523 ms | 0.799 / 1.402 ms | RustyDB 2.1x faster |
+| SELECT, 100 rows | 0.365 / 0.491 ms | 0.683 / 0.815 ms | RustyDB 1.9x faster |
+| SELECT, 1K rows | 3.773 / 4.009 ms | 4.741 / 5.292 ms | RustyDB 1.3x faster |
+| Indexed range, 100K rows | 1.920 / 2.376 ms | 1.098 / 1.780 ms | MySQL 1.7x faster |
+| JOIN + grouped aggregate | 6.285 / 6.537 ms | 4.315 / 4.788 ms | MySQL 1.5x faster |
+| CTE + subquery | 20.801 / 22.096 ms | 6.071 / 6.741 ms | MySQL 3.4x faster |
+| Single-row UPDATE | 1.608 / 1.800 ms | 0.904 / 1.021 ms | MySQL 1.8x faster |
+| Single-row DELETE, 10K table | 12.351 / 13.006 ms | 0.925 / 1.006 ms | MySQL 13.3x faster |
+
+The full 22-workload raw result set, including mean, minimum, maximum, standard deviation, median, and p95, is stored in [`benches/compare/results-0.3.0-beta-2026-06-21.csv`](benches/compare/results-0.3.0-beta-2026-06-21.csv). These figures are host-specific and should be regenerated for release comparisons on other systems.
 
 ### Key-Value Performance
 
-- **Reads (32 threads)**: ~1.1ms for 10K ops (~9M ops/sec)
-- **Writes (32 threads)**: ~970us for 10K ops (~10M ops/sec)
-- **Memory overhead**: ~24 bytes per key-value pair
+| Operation | Median | p95 |
+|-----------|-------:|----:|
+| GET | 51.6 ns | 51.9 ns |
+| SET | 288.3 ns | 304.2 ns |
+| 70/30 mixed workload | 125.7 ns | 127.0 ns |
+| 4-thread batch of 1K reads | 69.3 µs | 75.5 µs |
 
 ### Running Benchmarks
 
@@ -595,23 +625,23 @@ docker compose -f benches/compare/docker-compose.mysql.yml down
 - [x] Wire protocol integration tests
 - [x] Python client test suite
 
-### Phase 5: Optimization -- In Progress
+### Phase 5: Optimization -- Complete
 - [x] Lock-free reads (DashMap)
 - [x] Zero-copy reads (Arc<String>)
 - [x] Batch operations
-- [ ] Indexing (B-tree indexes)
-- [ ] Memory pooling
-- [ ] Bloom filters
-- [ ] LRU eviction
-- [ ] Query optimization
+- [x] Indexing (composite B-tree indexes)
+- [x] Memory pooling
+- [x] Bloom filters
+- [x] LRU parsed/optimized-plan cache
+- [x] Query optimization
 
-### Phase 6: Advanced SQL
-- [ ] JOIN operations (INNER JOIN, LEFT JOIN, RIGHT JOIN)
-- [ ] Subqueries and CTEs
-- [ ] Aggregate functions (COUNT, SUM, AVG, MAX, MIN)
-- [ ] GROUP BY and HAVING clauses
-- [ ] Transactions (BEGIN, COMMIT, ROLLBACK)
-- [ ] Constraints (FOREIGN KEY, UNIQUE, CHECK)
+### Phase 6: Advanced SQL -- Complete
+- [x] JOIN operations (INNER JOIN, LEFT JOIN, RIGHT JOIN)
+- [x] Subqueries and non-recursive CTEs
+- [x] Aggregate functions (COUNT, SUM, AVG, MAX, MIN)
+- [x] GROUP BY and HAVING clauses
+- [x] Transactions (BEGIN, COMMIT, ROLLBACK)
+- [x] Constraints (FOREIGN KEY, UNIQUE, CHECK)
 
 ## License
 

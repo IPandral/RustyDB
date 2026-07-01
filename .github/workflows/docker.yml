@@ -166,6 +166,23 @@ jobs:
           
           echo "Testing SHOW TABLES..."
           curl -s -u $AUTH http://localhost:8080/sql/tables | jq .
+
+          echo "Testing advanced SQL..."
+          curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+            -H "Content-Type: application/json" \
+            -d '{"query": "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount FLOAT, FOREIGN KEY (user_id) REFERENCES users(id))"}' | jq .
+          curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+            -H "Content-Type: application/json" \
+            -d '{"query": "INSERT INTO orders VALUES (1, 1, 10.5), (2, 1, 20.5)"}' | jq .
+          ADVANCED=$(curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+            -H "Content-Type: application/json" \
+            -d '{"query": "WITH totals AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) SELECT users.name, totals.total FROM users INNER JOIN totals ON users.id = totals.user_id"}')
+          echo "$ADVANCED" | jq .
+          TOTAL=$(echo "$ADVANCED" | jq -r '.data.rows[0][1]')
+          if [ "$TOTAL" != "31.0" ] && [ "$TOTAL" != "31" ]; then
+            echo "Advanced SQL returned unexpected total: $TOTAL"
+            exit 1
+          fi
           
           echo "SQL operations passed!"
 

@@ -31,7 +31,7 @@ impl Default for PersistenceConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("./data"),
-            flush_interval_ms: 1000, // 1 second
+            flush_interval_ms: 1000,              // 1 second
             snapshot_threshold: 10 * 1024 * 1024, // 10MB
         }
     }
@@ -117,17 +117,16 @@ impl PersistenceManager {
                     std::mem::take(&mut *pending)
                 };
 
-                if !ops_to_flush.is_empty() {
-                    if let Ok(mut file_guard) = wal_file.lock() {
-                        if let Some(ref mut file) = *file_guard {
-                            for op in &ops_to_flush {
-                                if let Ok(json) = serde_json::to_string(op) {
-                                    let _ = writeln!(file, "{}", json);
-                                }
-                            }
-                            let _ = file.sync_all();
+                if !ops_to_flush.is_empty()
+                    && let Ok(mut file_guard) = wal_file.lock()
+                    && let Some(ref mut file) = *file_guard
+                {
+                    for op in &ops_to_flush {
+                        if let Ok(json) = serde_json::to_string(op) {
+                            let _ = writeln!(file, "{}", json);
                         }
                     }
+                    let _ = file.sync_all();
                 }
             }
         });
@@ -148,8 +147,7 @@ impl PersistenceManager {
 
         let mut file_guard = self.wal_file.lock().unwrap();
         if let Some(ref mut file) = *file_guard {
-            writeln!(file, "{}", json)
-                .map_err(|e| format!("Failed to write to WAL: {}", e))?;
+            writeln!(file, "{}", json).map_err(|e| format!("Failed to write to WAL: {}", e))?;
             file.sync_all()
                 .map_err(|e| format!("Failed to sync WAL: {}", e))?;
         }
@@ -179,8 +177,8 @@ impl PersistenceManager {
 
         // Then, replay WAL on top of snapshot
         if self.wal_path.exists() {
-            let file = File::open(&self.wal_path)
-                .map_err(|e| format!("Failed to open WAL: {}", e))?;
+            let file =
+                File::open(&self.wal_path).map_err(|e| format!("Failed to open WAL: {}", e))?;
             let reader = BufReader::new(file);
 
             for line in reader.lines() {
@@ -203,8 +201,8 @@ impl PersistenceManager {
         // Write to temporary file first (atomic rename)
         let temp_path = self.snapshot_path.with_extension("tmp");
 
-        let mut file = File::create(&temp_path)
-            .map_err(|e| format!("Failed to create snapshot: {}", e))?;
+        let mut file =
+            File::create(&temp_path).map_err(|e| format!("Failed to create snapshot: {}", e))?;
 
         // Write only Set operations for current state
         for (key, value) in data {
@@ -214,8 +212,7 @@ impl PersistenceManager {
             };
             let json = serde_json::to_string(&op)
                 .map_err(|e| format!("Failed to serialize operation: {}", e))?;
-            writeln!(file, "{}", json)
-                .map_err(|e| format!("Failed to write snapshot: {}", e))?;
+            writeln!(file, "{}", json).map_err(|e| format!("Failed to write snapshot: {}", e))?;
         }
 
         file.sync_all()

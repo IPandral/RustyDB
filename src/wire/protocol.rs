@@ -1,5 +1,5 @@
-use sha1::{Sha1, Digest};
 use crate::sql::{DataType, Value};
+use sha1::{Digest, Sha1};
 
 // Capability Flags
 pub const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
@@ -15,6 +15,7 @@ pub const CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
 
 // Server Status Flags
 pub const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
+pub const SERVER_STATUS_IN_TRANS: u16 = 0x0001;
 
 // MySQL Column Types
 pub const MYSQL_TYPE_TINY: u8 = 0x01;
@@ -36,7 +37,7 @@ pub const COM_FIELD_LIST: u8 = 0x04;
 pub const COM_PING: u8 = 0x0E;
 
 // Server version - report as MySQL 5.7 so clients default to mysql_native_password
-pub const SERVER_VERSION: &str = "5.7.99-RustyDB";
+pub const SERVER_VERSION: &str = "5.7.99-RustyDB-0.3.0-beta";
 
 // Server capabilities to advertise
 pub const SERVER_CAPABILITIES: u32 = CLIENT_LONG_PASSWORD
@@ -99,6 +100,53 @@ pub fn read_null_terminated(data: &[u8], pos: &mut usize) -> String {
         *pos += 1; // skip null terminator
     }
     s
+}
+
+fn read_lenenc_int(data: &[u8], pos: &mut usize) -> Option<u64> {
+    if *pos >= data.len() {
+        return None;
+    }
+
+    let first = data[*pos];
+    *pos += 1;
+    match first {
+        0xFC => {
+            if data.len().saturating_sub(*pos) < 2 {
+                return None;
+            }
+            let value = u16::from_le_bytes([data[*pos], data[*pos + 1]]) as u64;
+            *pos += 2;
+            Some(value)
+        }
+        0xFD => {
+            if data.len().saturating_sub(*pos) < 3 {
+                return None;
+            }
+            let value = (data[*pos] as u64)
+                | ((data[*pos + 1] as u64) << 8)
+                | ((data[*pos + 2] as u64) << 16);
+            *pos += 3;
+            Some(value)
+        }
+        0xFE => {
+            if data.len().saturating_sub(*pos) < 8 {
+                return None;
+            }
+            let value = u64::from_le_bytes([
+                data[*pos],
+                data[*pos + 1],
+                data[*pos + 2],
+                data[*pos + 3],
+                data[*pos + 4],
+                data[*pos + 5],
+                data[*pos + 6],
+                data[*pos + 7],
+            ]);
+            *pos += 8;
+            Some(value)
+        }
+        value => Some(value as u64),
+    }
 }
 
 // ============================================================================
@@ -217,11 +265,19 @@ pub fn build_handshake_v10(conn_id: u32, scramble: &[u8; 20]) -> Vec<u8> {
 
 /// Build an OK packet payload.
 pub fn build_ok_packet(affected_rows: u64, last_insert_id: u64) -> Vec<u8> {
+    build_ok_packet_with_status(affected_rows, last_insert_id, SERVER_STATUS_AUTOCOMMIT)
+}
+
+pub fn build_ok_packet_with_status(
+    affected_rows: u64,
+    last_insert_id: u64,
+    status: u16,
+) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(16);
     pkt.push(0x00); // OK marker
     pkt.extend_from_slice(&encode_lenenc_int(affected_rows));
     pkt.extend_from_slice(&encode_lenenc_int(last_insert_id));
-    pkt.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes()); // status flags
+    pkt.extend_from_slice(&status.to_le_bytes()); // status flags
     pkt.extend_from_slice(&0u16.to_le_bytes()); // warnings
     pkt
 }
@@ -236,7 +292,11 @@ pub fn build_err_packet(code: u16, state: &str, msg: &str) -> Vec<u8> {
     // SQL state (exactly 5 bytes, padded with zeros)
     let state_bytes = state.as_bytes();
     for i in 0..5 {
-        pkt.push(if i < state_bytes.len() { state_bytes[i] } else { b'0' });
+        pkt.push(if i < state_bytes.len() {
+            state_bytes[i]
+        } else {
+            b'0'
+        });
     }
 
     pkt.extend_from_slice(msg.as_bytes());
@@ -245,10 +305,14 @@ pub fn build_err_packet(code: u16, state: &str, msg: &str) -> Vec<u8> {
 
 /// Build an EOF packet payload.
 pub fn build_eof_packet() -> Vec<u8> {
+    build_eof_packet_with_status(SERVER_STATUS_AUTOCOMMIT)
+}
+
+pub fn build_eof_packet_with_status(status: u16) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(5);
     pkt.push(0xFE); // EOF marker
     pkt.extend_from_slice(&0u16.to_le_bytes()); // warnings
-    pkt.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes()); // status flags
+    pkt.extend_from_slice(&status.to_le_bytes()); // status flags
     pkt
 }
 
@@ -261,17 +325,21 @@ pub fn build_column_count(count: u64) -> Vec<u8> {
 pub fn build_column_def(name: &str, table: &str, col_type: u8, col_flags: u16) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(128);
 
-    pkt.extend_from_slice(&encode_lenenc_str("def"));      // catalog
-    pkt.extend_from_slice(&encode_lenenc_str("rustydb"));   // schema
-    pkt.extend_from_slice(&encode_lenenc_str(table));       // virtual table
-    pkt.extend_from_slice(&encode_lenenc_str(table));       // physical table
-    pkt.extend_from_slice(&encode_lenenc_str(name));        // virtual column name
-    pkt.extend_from_slice(&encode_lenenc_str(name));        // physical column name
+    pkt.extend_from_slice(&encode_lenenc_str("def")); // catalog
+    pkt.extend_from_slice(&encode_lenenc_str("rustydb")); // schema
+    pkt.extend_from_slice(&encode_lenenc_str(table)); // virtual table
+    pkt.extend_from_slice(&encode_lenenc_str(table)); // physical table
+    pkt.extend_from_slice(&encode_lenenc_str(name)); // virtual column name
+    pkt.extend_from_slice(&encode_lenenc_str(name)); // physical column name
 
     pkt.push(0x0C); // length of fixed-length fields
 
     // Character set (2 bytes)
-    let charset: u16 = if col_type == MYSQL_TYPE_VAR_STRING { 45 } else { 63 };
+    let charset: u16 = if col_type == MYSQL_TYPE_VAR_STRING {
+        45
+    } else {
+        63
+    };
     pkt.extend_from_slice(&charset.to_le_bytes());
 
     // Column length (4 bytes)
@@ -367,7 +435,7 @@ pub fn parse_client_handshake(data: &[u8]) -> Result<ClientHandshake, String> {
     let mut pos = 0;
 
     // Capability flags (4 bytes LE)
-    let capabilities = u32::from_le_bytes([data[pos], data[pos+1], data[pos+2], data[pos+3]]);
+    let capabilities = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
     pos += 4;
 
     // Max packet size (4 bytes) - skip
@@ -384,16 +452,16 @@ pub fn parse_client_handshake(data: &[u8]) -> Result<ClientHandshake, String> {
 
     // Auth response
     let auth_response = if capabilities & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA != 0 {
-        if pos >= data.len() {
-            Vec::new()
-        } else {
-            let len = data[pos] as usize;
-            pos += 1;
-            let end = (pos + len).min(data.len());
-            let auth = data[pos..end].to_vec();
-            pos = end;
-            auth
+        let Some(len) = read_lenenc_int(data, &mut pos) else {
+            return Err("Invalid length-encoded auth response".to_string());
+        };
+        let len = len as usize;
+        if data.len().saturating_sub(pos) < len {
+            return Err("Auth response length exceeds packet size".to_string());
         }
+        let auth = data[pos..pos + len].to_vec();
+        pos += len;
+        auth
     } else if capabilities & CLIENT_SECURE_CONNECTION != 0 {
         if pos >= data.len() {
             Vec::new()

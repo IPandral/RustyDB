@@ -58,6 +58,9 @@ services:
       # - false: Persistent storage (data survives container restart)
       # - true:  Memory-only mode (faster, data lost on restart)
       - RUSTYDB_MEMORY_ONLY=${RUSTYDB_MEMORY_ONLY:-false}
+      - RUSTYDB_PLAN_CACHE_CAPACITY=${RUSTYDB_PLAN_CACHE_CAPACITY:-256}
+      - RUSTYDB_MEMORY_POOL_CAPACITY=${RUSTYDB_MEMORY_POOL_CAPACITY:-32}
+      - RUSTYDB_BLOOM_FALSE_POSITIVE_RATE=${RUSTYDB_BLOOM_FALSE_POSITIVE_RATE:-0.01}
     
     # =========================================================================
     # Persistent Storage
