@@ -6,12 +6,16 @@ pub mod types;
 
 #[allow(unused_imports)]
 pub use database::{
-    SQLConfig, SQLDatabase, SQLDatabaseOptions, SQLSession, SessionTransactionState,
+    PreparedStatement, SQLConfig, SQLDatabase, SQLDatabaseOptions, SQLSession,
+    SessionTransactionState,
 };
 #[allow(unused_imports)]
 pub use executor::{Catalog, ExecutionResult, Executor, Table};
 #[allow(unused_imports)]
-pub use parser::{Condition, SelectColumns, Statement, WhereClause, parse_sql};
+pub use parser::{
+    AlterOperation, Condition, InsertSource, PrepareSource, SelectColumns, Statement, WhereClause,
+    bind_parameters, parameter_count, parse_sql,
+};
 #[allow(unused_imports)]
 pub use planner::{Optimizer, Planner};
 #[allow(unused_imports)]

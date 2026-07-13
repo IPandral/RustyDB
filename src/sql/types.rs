@@ -290,6 +290,10 @@ pub enum Expr {
         name: String,
     },
     Literal(Value),
+    /// Positional `?` parameter assigned during statement preparation.
+    Parameter(usize),
+    /// Value proposed by an INSERT ... ON DUPLICATE KEY UPDATE statement.
+    Incoming(String),
     Binary {
         left: Box<Expr>,
         op: BinaryOp,

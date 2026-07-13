@@ -971,6 +971,60 @@ async fn test_tcp_unsupported_command() {
 }
 
 #[tokio::test]
+async fn test_tcp_binary_prepared_statement() {
+    let port = random_port().await;
+    let state = test_app_state(test_config(port));
+    let wire_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        let _ = rustydb::start_wire_server(wire_state, port).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    do_handshake(&mut stream, "test", "").await;
+
+    let mut prepare = vec![COM_STMT_PREPARE];
+    prepare.extend_from_slice(b"SELECT ? AS answer");
+    write_packet(&mut stream, 0, &prepare).await;
+    let (_, prepared) = read_packet(&mut stream).await;
+    assert_eq!(prepared[0], 0x00);
+    let statement_id = u32::from_le_bytes(prepared[1..5].try_into().unwrap());
+    assert_eq!(u16::from_le_bytes(prepared[5..7].try_into().unwrap()), 1);
+    assert_eq!(u16::from_le_bytes(prepared[7..9].try_into().unwrap()), 1);
+    let _ = read_packet(&mut stream).await; // parameter definition
+    let (_, eof) = read_packet(&mut stream).await;
+    assert_eq!(eof[0], 0xFE);
+    let _ = read_packet(&mut stream).await; // result column definition
+    let (_, eof) = read_packet(&mut stream).await;
+    assert_eq!(eof[0], 0xFE);
+
+    let mut execute = vec![COM_STMT_EXECUTE];
+    execute.extend_from_slice(&statement_id.to_le_bytes());
+    execute.push(0); // no cursor
+    execute.extend_from_slice(&1u32.to_le_bytes());
+    execute.push(0); // null bitmap
+    execute.push(1); // new parameter types
+    execute.push(MYSQL_TYPE_LONGLONG);
+    execute.push(0);
+    execute.extend_from_slice(&42i64.to_le_bytes());
+    write_packet(&mut stream, 0, &execute).await;
+    let (_, column_count) = read_packet(&mut stream).await;
+    assert_eq!(column_count, vec![1]);
+    let _ = read_packet(&mut stream).await;
+    let _ = read_packet(&mut stream).await;
+    let (_, row) = read_packet(&mut stream).await;
+    assert_eq!(row[0], 0x00);
+    assert_eq!(i64::from_le_bytes(row[2..10].try_into().unwrap()), 42);
+    let _ = read_packet(&mut stream).await;
+
+    let mut close = vec![COM_STMT_CLOSE];
+    close.extend_from_slice(&statement_id.to_le_bytes());
+    write_packet(&mut stream, 0, &close).await;
+    send_quit(&mut stream).await;
+}
+
+#[tokio::test]
 async fn test_tcp_multiple_queries_same_connection() {
     let port = random_port().await;
     let state = test_app_state(test_config(port));
