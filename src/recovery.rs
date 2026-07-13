@@ -599,7 +599,16 @@ pub fn parse_rfc3339(value: &str) -> Result<SystemTime, String> {
         .next()
         .and_then(|v| v.parse().ok())
         .ok_or_else(|| "Invalid timestamp day".to_string())?;
-    if date_parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if date_parts.next().is_some() || !(1..=12).contains(&month) {
+        return Err("Invalid timestamp date".to_string());
+    }
+    let days_in_month = match month {
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=days_in_month).contains(&day) {
         return Err("Invalid timestamp date".to_string());
     }
     let (clock, offset_seconds) =
@@ -651,8 +660,14 @@ pub fn parse_rfc3339(value: &str) -> Result<SystemTime, String> {
         return Err("Invalid timestamp second".to_string());
     }
     let millis = if fraction.is_empty() {
+        if second_part.ends_with('.') {
+            return Err("Invalid timestamp fraction".to_string());
+        }
         0
     } else {
+        if !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("Invalid timestamp fraction".to_string());
+        }
         let digits = fraction.chars().take(3).collect::<String>();
         let parsed: u64 = digits
             .parse()
@@ -667,6 +682,10 @@ pub fn parse_rfc3339(value: &str) -> Result<SystemTime, String> {
     Ok(UNIX_EPOCH
         + std::time::Duration::from_secs(unix_seconds as u64)
         + std::time::Duration::from_millis(millis))
+}
+
+fn is_leap_year(year: i32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
@@ -780,5 +799,11 @@ mod tests {
                 kv_sequence: 34
             }
         );
+        assert!(parse_rfc3339("2024-02-29T00:00:00Z").is_ok());
+        assert!(parse_rfc3339("2026-02-29T00:00:00Z").is_err());
+        assert!(parse_rfc3339("2026-02-31T00:00:00Z").is_err());
+        assert!(parse_rfc3339("2026-04-31T00:00:00Z").is_err());
+        assert!(parse_rfc3339("2026-01-01T00:00:00.Z").is_err());
+        assert!(parse_rfc3339("2026-01-01T00:00:00.123abcZ").is_err());
     }
 }

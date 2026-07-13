@@ -13,7 +13,7 @@ use super::parser::{PrepareSource, Statement, bind_parameters, parameter_count, 
 use super::planner::Optimizer;
 use super::types::Value;
 #[cfg(feature = "server")]
-use super::types::{AggregateFunction, DataType, Expr, SelectItem, TableSource};
+use super::types::{AggregateFunction, BinaryOp, DataType, Expr, SelectItem, TableSource, UnaryOp};
 
 const CATALOG_FORMAT_VERSION: u32 = 1;
 const WAL_FORMAT_VERSION: u32 = 2;
@@ -709,6 +709,48 @@ impl PreparedStatement {
     }
 }
 
+#[cfg(feature = "server")]
+fn prepared_expression_type(expression: &Expr, source_table: Option<&Table>) -> DataType {
+    match expression {
+        Expr::Literal(value) => value.data_type(),
+        Expr::Column { name, .. } => source_table
+            .and_then(|table| table.schema.column(name))
+            .map(|column| column.data_type.clone())
+            .unwrap_or(DataType::Text),
+        Expr::Binary { left, op, right } => match op {
+            BinaryOp::Compare(_) | BinaryOp::And | BinaryOp::Or => DataType::Boolean,
+            BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide => {
+                let left = prepared_expression_type(left, source_table);
+                let right = prepared_expression_type(right, source_table);
+                match (left, right) {
+                    (DataType::Float, _) | (_, DataType::Float) => DataType::Float,
+                    (DataType::Integer, DataType::Integer) => DataType::Integer,
+                    (DataType::Null, data_type) | (data_type, DataType::Null) => data_type,
+                    _ => DataType::Text,
+                }
+            }
+        },
+        Expr::Unary { op, expr } => match op {
+            UnaryOp::Not => DataType::Boolean,
+            UnaryOp::Negate | UnaryOp::Plus => prepared_expression_type(expr, source_table),
+        },
+        Expr::IsNull { .. }
+        | Expr::Like { .. }
+        | Expr::InList { .. }
+        | Expr::InSubquery { .. }
+        | Expr::Exists { .. } => DataType::Boolean,
+        Expr::Aggregate { function, expr, .. } => match function {
+            AggregateFunction::Count => DataType::Integer,
+            AggregateFunction::Avg => DataType::Float,
+            AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => expr
+                .as_deref()
+                .map(|expr| prepared_expression_type(expr, source_table))
+                .unwrap_or(DataType::Text),
+        },
+        Expr::Parameter(_) | Expr::Incoming(_) | Expr::ScalarSubquery(_) => DataType::Text,
+    }
+}
+
 impl SQLSession {
     pub fn execute(&self, sql: &str) -> ExecutionResult {
         let statement = match self.database.parse_cached(sql) {
@@ -875,8 +917,12 @@ impl SQLSession {
     pub(crate) fn prepared_result_metadata(
         &self,
         prepared: &PreparedStatement,
+        parameters: Option<&[Value]>,
     ) -> Vec<(String, DataType)> {
-        let Statement::Query(query) = &prepared.statement else {
+        let bound_statement = parameters
+            .and_then(|values| bind_parameters(&prepared.statement, values).ok())
+            .unwrap_or_else(|| prepared.statement.clone());
+        let Statement::Query(query) = &bound_statement else {
             return Vec::new();
         };
         let catalog = self.database.inner.executor.snapshot();
@@ -913,19 +959,10 @@ impl SQLSession {
                         }
                         _ => "expression".to_string(),
                     });
-                    let data_type = match expr {
-                        Expr::Literal(value) => value.data_type(),
-                        Expr::Column { name, .. } => source_table
-                            .and_then(|(table, _)| table.schema.column(name))
-                            .map(|column| column.data_type.clone())
-                            .unwrap_or(DataType::Text),
-                        Expr::Aggregate {
-                            function: AggregateFunction::Count,
-                            ..
-                        } => DataType::Integer,
-                        Expr::Aggregate { .. } => DataType::Float,
-                        _ => DataType::Text,
-                    };
+                    let data_type = prepared_expression_type(
+                        expr,
+                        source_table.map(|(table, _)| table.as_ref()),
+                    );
                     result.push((name, data_type));
                 }
             }
@@ -1124,6 +1161,65 @@ mod tests {
         assert_eq!(
             result.rows[0].values,
             vec![Value::Text("deux".to_string()), Value::Boolean(true)]
+        );
+    }
+
+    #[test]
+    fn multi_row_upsert_maintains_unique_indexes_incrementally() {
+        let database = SQLDatabase::new();
+        assert!(!matches!(
+            database.execute(
+                "CREATE TABLE indexed_upsert (id INT PRIMARY KEY, email TEXT UNIQUE, hits INT)"
+            ),
+            ExecutionResult::Error(_)
+        ));
+        assert!(matches!(
+            database.execute("INSERT INTO indexed_upsert VALUES (1, 'a', 0)"),
+            ExecutionResult::RowsAffected(1)
+        ));
+        assert!(matches!(
+            database.execute(
+                "INSERT INTO indexed_upsert VALUES (2, 'b', 1), (3, 'c', 1), (4, 'b', 1) \
+                 ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits)"
+            ),
+            ExecutionResult::RowsAffected(4)
+        ));
+        assert!(matches!(
+            database.execute(
+                "INSERT INTO indexed_upsert VALUES (1, 'z', 1), (5, 'z', 1) \
+                 ON DUPLICATE KEY UPDATE email = VALUES(email), hits = hits + VALUES(hits)"
+            ),
+            ExecutionResult::RowsAffected(4)
+        ));
+
+        let ExecutionResult::Select(result) =
+            database.execute("SELECT id, email, hits FROM indexed_upsert ORDER BY id")
+        else {
+            panic!("expected rows");
+        };
+        assert_eq!(
+            result
+                .rows
+                .iter()
+                .map(|row| row.values.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![
+                    Value::Integer(1),
+                    Value::Text("z".to_string()),
+                    Value::Integer(2),
+                ],
+                vec![
+                    Value::Integer(2),
+                    Value::Text("b".to_string()),
+                    Value::Integer(2),
+                ],
+                vec![
+                    Value::Integer(3),
+                    Value::Text("c".to_string()),
+                    Value::Integer(1),
+                ],
+            ]
         );
     }
 

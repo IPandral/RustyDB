@@ -230,18 +230,133 @@ impl Table {
             .collect()
     }
 
-    fn insert_rows(&mut self, rows: Vec<Row>) -> Result<usize, String> {
-        for row in &rows {
-            self.schema.validate_row(&row.values)?;
+    fn insert_row_indexed(&mut self, row: Row) -> Result<(), String> {
+        self.schema.validate_row(&row.values)?;
+        let position = self.rows.len();
+        let row_id = self.next_row_id;
+        let primary_key = self
+            .schema
+            .primary_key_index()
+            .and_then(|index| row.values.get(index))
+            .map(ToString::to_string);
+        let index_keys: Vec<_> = self
+            .indexes
+            .iter()
+            .filter_map(|(name, index)| {
+                self.index_key(&row, &index.definition.columns)
+                    .map(|key| (name.clone(), key))
+            })
+            .collect();
+
+        self.rows.push(row);
+        self.row_ids.push(row_id);
+        self.next_row_id = self.next_row_id.saturating_add(1);
+        if let Some(primary_key) = primary_key {
+            self.primary_key_index.insert(primary_key, position);
         }
-        let count = rows.len();
-        for row in rows {
-            self.rows.push(row);
-            self.row_ids.push(self.next_row_id);
-            self.next_row_id = self.next_row_id.saturating_add(1);
+        for (name, key) in index_keys {
+            if let Some(index) = self.indexes.get_mut(&name) {
+                index.entries.entry(key.clone()).or_default().insert(row_id);
+                index.bloom.insert(&key);
+            }
         }
-        self.rebuild_index();
-        Ok(count)
+        Ok(())
+    }
+
+    fn replace_row_indexed(&mut self, position: usize, row: Row) -> Result<(), String> {
+        self.schema.validate_row(&row.values)?;
+        let Some(previous) = self.rows.get(position).cloned() else {
+            return Err("Row position is out of bounds".to_string());
+        };
+        let row_id = self
+            .row_ids
+            .get(position)
+            .copied()
+            .ok_or_else(|| "Row ID is unavailable".to_string())?;
+        let primary_index = self.schema.primary_key_index();
+        let previous_primary = primary_index
+            .and_then(|index| previous.values.get(index))
+            .map(ToString::to_string);
+        let next_primary = primary_index
+            .and_then(|index| row.values.get(index))
+            .map(ToString::to_string);
+        let index_changes: Vec<_> = self
+            .indexes
+            .iter()
+            .map(|(name, index)| {
+                (
+                    name.clone(),
+                    self.index_key(&previous, &index.definition.columns),
+                    self.index_key(&row, &index.definition.columns),
+                )
+            })
+            .collect();
+
+        self.rows[position] = row;
+        if previous_primary != next_primary {
+            if let Some(previous_primary) = previous_primary
+                && self.primary_key_index.get(&previous_primary) == Some(&position)
+            {
+                self.primary_key_index.remove(&previous_primary);
+            }
+            if let Some(next_primary) = next_primary {
+                self.primary_key_index.insert(next_primary, position);
+            }
+        }
+        for (name, previous_key, next_key) in index_changes {
+            if previous_key == next_key {
+                continue;
+            }
+            let Some(index) = self.indexes.get_mut(&name) else {
+                continue;
+            };
+            if let Some(previous_key) = previous_key {
+                let remove_entry = if let Some(row_ids) = index.entries.get_mut(&previous_key) {
+                    row_ids.remove(&row_id);
+                    row_ids.is_empty()
+                } else {
+                    false
+                };
+                if remove_entry {
+                    index.entries.remove(&previous_key);
+                }
+            }
+            if let Some(next_key) = next_key {
+                index
+                    .entries
+                    .entry(next_key.clone())
+                    .or_default()
+                    .insert(row_id);
+                index.bloom.insert(&next_key);
+            }
+        }
+        Ok(())
+    }
+
+    fn unique_conflict_positions(&self, row: &Row) -> HashSet<usize> {
+        let mut conflicts = HashSet::new();
+        for index in self
+            .indexes
+            .values()
+            .filter(|index| index.definition.unique)
+        {
+            let Some(key) = self.index_key(row, &index.definition.columns) else {
+                continue;
+            };
+            // SQL UNIQUE constraints permit multiple NULL-containing keys.
+            if key.contains(&KeyPart::Null) || !index.bloom.might_contain(&key) {
+                continue;
+            }
+            let Some(row_ids) = index.entries.get(&key) else {
+                continue;
+            };
+            for row_id in row_ids {
+                if let Ok(position) = self.row_ids.binary_search(row_id) {
+                    conflicts.insert(position);
+                }
+            }
+        }
+        conflicts
     }
 
     fn candidate_row_ids(
@@ -1492,39 +1607,9 @@ fn execute_insert(
     }
     let mut count = 0;
     for row in rows {
-        let conflicts: HashSet<usize> = table
-            .schema
-            .indexes
-            .iter()
-            .filter(|index| index.unique)
-            .flat_map(|index| {
-                let indices: Option<Vec<_>> = index
-                    .columns
-                    .iter()
-                    .map(|column| table.schema.column_index(column))
-                    .collect();
-                let Some(indices) = indices else {
-                    return Vec::new().into_iter();
-                };
-                if indices.iter().any(|index| row.values[*index].is_null()) {
-                    return Vec::new().into_iter();
-                }
-                table
-                    .rows
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, existing)| {
-                        indices
-                            .iter()
-                            .all(|idx| existing.values[*idx] == row.values[*idx])
-                    })
-                    .map(|(position, _)| position)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-            })
-            .collect();
+        let conflicts = table.unique_conflict_positions(&row);
         if conflicts.is_empty() {
-            if let Err(error) = table.insert_rows(vec![row]) {
+            if let Err(error) = table.insert_row_indexed(row) {
                 return ExecutionResult::Error(error);
             }
             count += 1;
@@ -1562,9 +1647,10 @@ fn execute_insert(
                 }
             }
             if updated != current {
-                table.rows[position] = Row::new(updated);
+                if let Err(error) = table.replace_row_indexed(position, Row::new(updated)) {
+                    return ExecutionResult::Error(error);
+                }
                 count += 2;
-                table.rebuild_index();
             }
         }
     }

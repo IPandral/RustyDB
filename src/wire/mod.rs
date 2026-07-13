@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::server::AppState;
-use crate::sql::{ExecutionResult, PreparedStatement, ResultSet, Row, Value};
+use crate::sql::{DataType, ExecutionResult, PreparedStatement, ResultSet, Row, Value};
 use protocol::*;
 
 static NEXT_CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
@@ -290,21 +290,25 @@ fn encode_result(result: &ExecutionResult, status: u16) -> Vec<Vec<u8>> {
     }
 }
 
-fn encode_prepared_result(result: &ExecutionResult, status: u16) -> Vec<Vec<u8>> {
+fn encode_prepared_result(
+    result: &ExecutionResult,
+    result_metadata: &[(String, DataType)],
+    status: u16,
+) -> Vec<Vec<u8>> {
     match result {
         ExecutionResult::Select(result) => {
             let mut packets = Vec::new();
             packets.push(build_column_count(result.columns.len() as u64));
             for (index, column) in result.columns.iter().enumerate() {
-                let value = result.rows.first().and_then(|row| row.values.get(index));
-                let data_type = value
-                    .map(Value::data_type)
-                    .unwrap_or(crate::sql::DataType::Text);
+                let data_type = result_metadata
+                    .get(index)
+                    .map(|(_, data_type)| data_type)
+                    .unwrap_or(&DataType::Text);
                 packets.push(build_column_def(
                     column,
                     "",
-                    datatype_to_mysql(&data_type),
-                    column_flags(&data_type, true, false),
+                    datatype_to_mysql(data_type),
+                    column_flags(data_type, true, false),
                 ));
             }
             packets.push(build_eof_packet_with_status(status));
@@ -619,7 +623,7 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
                         let statement_id = next_statement_id;
                         next_statement_id = next_statement_id.wrapping_add(1).max(1);
                         let count = prepared.parameter_count();
-                        let result_metadata = session.prepared_result_metadata(&prepared);
+                        let result_metadata = session.prepared_result_metadata(&prepared, None);
                         let mut packets = vec![build_stmt_prepare_ok(
                             statement_id,
                             result_metadata.len() as u16,
@@ -669,7 +673,7 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
             }
 
             COM_STMT_EXECUTE => {
-                if data.len() < 5 {
+                if data.len() < 10 {
                     let packet =
                         build_err_packet(1243, "HY000", "Invalid statement execute packet");
                     if write_packet(&mut stream, 1, &packet).await.is_err() {
@@ -696,13 +700,15 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
                         continue;
                     }
                 };
+                let result_metadata =
+                    session.prepared_result_metadata(&statement.prepared, Some(&parameters));
                 let result = session.execute_prepared(&statement.prepared, &parameters);
                 let status = if session.is_in_transaction() {
                     SERVER_STATUS_AUTOCOMMIT | SERVER_STATUS_IN_TRANS
                 } else {
                     SERVER_STATUS_AUTOCOMMIT
                 };
-                let packets = encode_prepared_result(&result, status);
+                let packets = encode_prepared_result(&result, &result_metadata, status);
                 if write_packets(&mut stream, 1, &packets).await.is_err() {
                     break;
                 }
@@ -710,7 +716,9 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
 
             COM_STMT_SEND_LONG_DATA => {
                 if data.len() < 7 {
-                    break;
+                    // This command has no response packet. Ignore malformed payloads without
+                    // dropping an otherwise healthy connection.
+                    continue;
                 }
                 let statement_id = u32::from_le_bytes(data[1..5].try_into().unwrap());
                 let parameter_id = u16::from_le_bytes(data[5..7].try_into().unwrap()) as usize;
@@ -726,7 +734,11 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
 
             COM_STMT_RESET => {
                 if data.len() < 5 {
-                    break;
+                    let packet = build_err_packet(1243, "HY000", "Invalid statement reset packet");
+                    if write_packet(&mut stream, 1, &packet).await.is_err() {
+                        break;
+                    }
+                    continue;
                 }
                 let statement_id = u32::from_le_bytes(data[1..5].try_into().unwrap());
                 let packet = if let Some(statement) = prepared_statements.get_mut(&statement_id) {

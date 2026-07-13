@@ -212,6 +212,30 @@ async fn random_port() -> u16 {
     port
 }
 
+async fn connect_with_retry(port: u16) -> TcpStream {
+    let address = format!("127.0.0.1:{port}");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match TcpStream::connect(&address).await {
+            Ok(stream) => return stream,
+            Err(error) if tokio::time::Instant::now() >= deadline => {
+                panic!("wire server did not become ready at {address}: {error}")
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+        }
+    }
+}
+
+fn column_definition_type(packet: &[u8]) -> u8 {
+    let mut position = 0;
+    for _ in 0..6 {
+        let length = read_lenenc_int(packet, &mut position).expect("column definition string");
+        position += length as usize;
+    }
+    assert_eq!(packet[position], 0x0C, "column definition fixed fields");
+    packet[position + 7]
+}
+
 #[test]
 fn test_encode_lenenc_int_single_byte() {
     assert_eq!(encode_lenenc_int(0), vec![0x00]);
@@ -978,10 +1002,7 @@ async fn test_tcp_binary_prepared_statement() {
     tokio::spawn(async move {
         let _ = rustydb::start_wire_server(wire_state, port).await;
     });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
+    let mut stream = connect_with_retry(port).await;
     do_handshake(&mut stream, "test", "").await;
 
     let mut prepare = vec![COM_STMT_PREPARE];
@@ -1011,7 +1032,11 @@ async fn test_tcp_binary_prepared_statement() {
     write_packet(&mut stream, 0, &execute).await;
     let (_, column_count) = read_packet(&mut stream).await;
     assert_eq!(column_count, vec![1]);
-    let _ = read_packet(&mut stream).await;
+    let (_, column_definition) = read_packet(&mut stream).await;
+    assert_eq!(
+        column_definition_type(&column_definition),
+        MYSQL_TYPE_LONGLONG
+    );
     let _ = read_packet(&mut stream).await;
     let (_, row) = read_packet(&mut stream).await;
     assert_eq!(row[0], 0x00);
@@ -1021,6 +1046,105 @@ async fn test_tcp_binary_prepared_statement() {
     let mut close = vec![COM_STMT_CLOSE];
     close.extend_from_slice(&statement_id.to_le_bytes());
     write_packet(&mut stream, 0, &close).await;
+    send_quit(&mut stream).await;
+}
+
+#[tokio::test]
+async fn test_tcp_prepared_empty_result_uses_declared_metadata() {
+    let port = random_port().await;
+    let state = test_app_state(test_config(port));
+    let wire_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        let _ = rustydb::start_wire_server(wire_state, port).await;
+    });
+    let mut stream = connect_with_retry(port).await;
+    do_handshake(&mut stream, "test", "").await;
+    send_query(
+        &mut stream,
+        "CREATE TABLE prepared_types (id INT PRIMARY KEY)",
+    )
+    .await;
+
+    let mut prepare = vec![COM_STMT_PREPARE];
+    prepare.extend_from_slice(b"SELECT id FROM prepared_types WHERE id = ?");
+    write_packet(&mut stream, 0, &prepare).await;
+    let (_, prepared) = read_packet(&mut stream).await;
+    let statement_id = u32::from_le_bytes(prepared[1..5].try_into().unwrap());
+    let _ = read_packet(&mut stream).await; // parameter definition
+    let _ = read_packet(&mut stream).await; // parameter EOF
+    let (_, prepared_column) = read_packet(&mut stream).await;
+    assert_eq!(
+        column_definition_type(&prepared_column),
+        MYSQL_TYPE_LONGLONG
+    );
+    let _ = read_packet(&mut stream).await; // result metadata EOF
+
+    let mut execute = vec![COM_STMT_EXECUTE];
+    execute.extend_from_slice(&statement_id.to_le_bytes());
+    execute.push(0);
+    execute.extend_from_slice(&1u32.to_le_bytes());
+    execute.push(0);
+    execute.push(1);
+    execute.push(MYSQL_TYPE_LONGLONG);
+    execute.push(0);
+    execute.extend_from_slice(&7i64.to_le_bytes());
+    write_packet(&mut stream, 0, &execute).await;
+    let (_, column_count) = read_packet(&mut stream).await;
+    assert_eq!(column_count, vec![1]);
+    let (_, execution_column) = read_packet(&mut stream).await;
+    assert_eq!(
+        column_definition_type(&execution_column),
+        MYSQL_TYPE_LONGLONG
+    );
+    let _ = read_packet(&mut stream).await; // column EOF
+    let (_, row_eof) = read_packet(&mut stream).await;
+    assert_eq!(row_eof[0], 0xFE, "empty result should end with EOF");
+
+    let mut close = vec![COM_STMT_CLOSE];
+    close.extend_from_slice(&statement_id.to_le_bytes());
+    write_packet(&mut stream, 0, &close).await;
+    send_quit(&mut stream).await;
+}
+
+#[tokio::test]
+async fn test_tcp_malformed_prepared_commands_keep_connection_alive() {
+    let port = random_port().await;
+    let state = test_app_state(test_config(port));
+    let wire_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        let _ = rustydb::start_wire_server(wire_state, port).await;
+    });
+    let mut stream = connect_with_retry(port).await;
+    do_handshake(&mut stream, "test", "").await;
+
+    let mut prepare = vec![COM_STMT_PREPARE];
+    prepare.extend_from_slice(b"SELECT 1");
+    write_packet(&mut stream, 0, &prepare).await;
+    let (_, prepared) = read_packet(&mut stream).await;
+    let statement_id = u32::from_le_bytes(prepared[1..5].try_into().unwrap());
+    let _ = read_packet(&mut stream).await; // result column definition
+    let _ = read_packet(&mut stream).await; // result metadata EOF
+
+    write_packet(&mut stream, 0, &[COM_STMT_SEND_LONG_DATA]).await;
+    send_ping(&mut stream).await;
+
+    write_packet(&mut stream, 0, &[COM_STMT_RESET]).await;
+    let (_, reset_error) = read_packet(&mut stream).await;
+    assert_eq!(reset_error[0], 0xFF);
+    assert_eq!(u16::from_le_bytes([reset_error[1], reset_error[2]]), 1243);
+    send_ping(&mut stream).await;
+
+    let mut short_execute = vec![COM_STMT_EXECUTE];
+    short_execute.extend_from_slice(&statement_id.to_le_bytes());
+    short_execute.push(0);
+    write_packet(&mut stream, 0, &short_execute).await;
+    let (_, execute_error) = read_packet(&mut stream).await;
+    assert_eq!(execute_error[0], 0xFF);
+    assert_eq!(
+        u16::from_le_bytes([execute_error[1], execute_error[2]]),
+        1243
+    );
+    send_ping(&mut stream).await;
     send_quit(&mut stream).await;
 }
 
