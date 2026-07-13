@@ -9,11 +9,14 @@ use std::sync::{Arc, Mutex};
 use super::executor::{
     Catalog, ExecutionResult, Executor, Table, is_transaction_control, is_write_statement,
 };
-use super::parser::{Statement, parse_sql};
+use super::parser::{PrepareSource, Statement, bind_parameters, parameter_count, parse_sql};
 use super::planner::Optimizer;
+use super::types::Value;
+#[cfg(feature = "server")]
+use super::types::{AggregateFunction, BinaryOp, DataType, Expr, SelectItem, TableSource, UnaryOp};
 
 const CATALOG_FORMAT_VERSION: u32 = 1;
-const WAL_FORMAT_VERSION: u32 = 1;
+const WAL_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct SQLDatabaseOptions {
@@ -69,16 +72,60 @@ struct PersistedTable {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct CatalogSnapshot {
-    format_version: u32,
-    catalog_version: u64,
+pub(crate) struct CatalogSnapshot {
+    pub(crate) format_version: u32,
+    pub(crate) catalog_version: u64,
     #[serde(default)]
-    schema_version: u64,
-    tables: HashMap<String, Table>,
+    pub(crate) schema_version: u64,
+    #[serde(default)]
+    pub(crate) timestamp_millis: u64,
+    pub(crate) tables: HashMap<String, Table>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct WalRecord {
+pub(crate) struct WalRecord {
+    pub(crate) format_version: u32,
+    pub(crate) base_version: u64,
+    pub(crate) commit_version: u64,
+    pub(crate) timestamp_millis: u64,
+    pub(crate) statements: Vec<DurableStatement>,
+    pub(crate) checksum: u32,
+}
+
+impl WalRecord {
+    fn new(base_version: u64, commit_version: u64, statements: Vec<DurableStatement>) -> Self {
+        let timestamp_millis = now_millis();
+        let checksum = wal_checksum(base_version, commit_version, timestamp_millis, &statements);
+        Self {
+            format_version: WAL_FORMAT_VERSION,
+            base_version,
+            commit_version,
+            timestamp_millis,
+            statements,
+            checksum,
+        }
+    }
+
+    pub(crate) fn valid(&self) -> bool {
+        self.format_version == WAL_FORMAT_VERSION
+            && self.checksum
+                == wal_checksum(
+                    self.base_version,
+                    self.commit_version,
+                    self.timestamp_millis,
+                    &self.statements,
+                )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum DurableStatement {
+    Sql(String),
+    Bound(Box<Statement>),
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyWalRecord {
     format_version: u32,
     base_version: u64,
     commit_version: u64,
@@ -86,26 +133,7 @@ struct WalRecord {
     checksum: u32,
 }
 
-impl WalRecord {
-    fn new(base_version: u64, commit_version: u64, statements: Vec<String>) -> Self {
-        let checksum = wal_checksum(base_version, commit_version, &statements);
-        Self {
-            format_version: WAL_FORMAT_VERSION,
-            base_version,
-            commit_version,
-            statements,
-            checksum,
-        }
-    }
-
-    fn valid(&self) -> bool {
-        self.format_version == WAL_FORMAT_VERSION
-            && self.checksum
-                == wal_checksum(self.base_version, self.commit_version, &self.statements)
-    }
-}
-
-fn wal_checksum(base_version: u64, commit_version: u64, statements: &[String]) -> u32 {
+fn legacy_wal_checksum(base_version: u64, commit_version: u64, statements: &[String]) -> u32 {
     let mut hasher = Hasher::new();
     hasher.update(&base_version.to_le_bytes());
     hasher.update(&commit_version.to_le_bytes());
@@ -114,6 +142,27 @@ fn wal_checksum(base_version: u64, commit_version: u64, statements: &[String]) -
         hasher.update(statement.as_bytes());
     }
     hasher.finalize()
+}
+
+fn wal_checksum(
+    base_version: u64,
+    commit_version: u64,
+    timestamp_millis: u64,
+    statements: &[DurableStatement],
+) -> u32 {
+    let mut hasher = Hasher::new();
+    hasher.update(&base_version.to_le_bytes());
+    hasher.update(&commit_version.to_le_bytes());
+    hasher.update(&timestamp_millis.to_le_bytes());
+    hasher.update(&serde_json::to_vec(statements).unwrap_or_default());
+    hasher.finalize()
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 struct PlanCacheEntry {
@@ -183,6 +232,7 @@ struct DatabaseInner {
     config: SQLConfig,
     wal: Mutex<Option<File>>,
     plan_cache: Mutex<PlanCache>,
+    _data_lock: Option<crate::lock::DataDirLock>,
 }
 
 /// Main embedded SQL database. Clones share the same catalog and WAL.
@@ -207,6 +257,7 @@ impl SQLDatabase {
                 config,
                 wal: Mutex::new(None),
                 plan_cache: Mutex::new(PlanCache::new(options.plan_cache_capacity)),
+                _data_lock: None,
             }),
         }
     }
@@ -219,6 +270,7 @@ impl SQLDatabase {
         let config = SQLConfig::new(data_dir).with_options(options.clone());
         fs::create_dir_all(&config.data_dir)
             .map_err(|error| format!("Failed to create data directory: {error}"))?;
+        let data_lock = crate::lock::DataDirLock::acquire(&config.data_dir, "sql")?;
 
         let mut catalog = Self::load_catalog(&config)?;
         let wal_path = config.data_dir.join("sql_wal.log");
@@ -240,6 +292,7 @@ impl SQLDatabase {
                 config,
                 wal: Mutex::new(Some(wal)),
                 plan_cache: Mutex::new(PlanCache::new(options.plan_cache_capacity)),
+                _data_lock: Some(data_lock),
             }),
         })
     }
@@ -252,6 +305,8 @@ impl SQLDatabase {
         SQLSession {
             database: self.clone(),
             transaction: Mutex::new(None),
+            variables: Mutex::new(HashMap::new()),
+            prepared: Mutex::new(HashMap::new()),
         }
     }
 
@@ -264,6 +319,11 @@ impl SQLDatabase {
         if is_transaction_control(&statement) {
             return ExecutionResult::Error(
                 "BEGIN/COMMIT/ROLLBACK require SQLDatabase::session()".to_string(),
+            );
+        }
+        if is_session_statement(&statement) {
+            return ExecutionResult::Error(
+                "Prepared statements and user variables require SQLDatabase::session()".to_string(),
             );
         }
         self.execute_autocommit(sql, statement)
@@ -291,6 +351,14 @@ impl SQLDatabase {
     }
 
     fn execute_autocommit(&self, sql: &str, statement: Statement) -> ExecutionResult {
+        self.execute_autocommit_durable(DurableStatement::Sql(sql.trim().to_string()), statement)
+    }
+
+    fn execute_autocommit_durable(
+        &self,
+        durable: DurableStatement,
+        statement: Statement,
+    ) -> ExecutionResult {
         if !is_write_statement(&statement) {
             let mut snapshot = self.inner.executor.snapshot();
             return Executor::execute_catalog(&mut snapshot, statement);
@@ -311,9 +379,7 @@ impl SQLDatabase {
             working.schema_version = catalog.schema_version.saturating_add(1);
         }
         working.version = base_version.saturating_add(1);
-        if let Err(error) =
-            self.log_transaction(base_version, working.version, vec![sql.trim().to_string()])
-        {
+        if let Err(error) = self.log_transaction(base_version, working.version, vec![durable]) {
             return ExecutionResult::Error(format!("WAL error: {error}"));
         }
         *catalog = working;
@@ -342,7 +408,7 @@ impl SQLDatabase {
         &self,
         base_version: u64,
         commit_version: u64,
-        statements: Vec<String>,
+        statements: Vec<DurableStatement>,
     ) -> Result<(), String> {
         let record = WalRecord::new(base_version, commit_version, statements);
         let encoded = serde_json::to_string(&record)
@@ -370,6 +436,46 @@ impl SQLDatabase {
             if let Ok(record) = serde_json::from_str::<WalRecord>(&line) {
                 if !record.valid() {
                     // A checksum mismatch is treated as a partial trailing record.
+                    break;
+                }
+                if record.commit_version <= catalog.version {
+                    continue;
+                }
+                if record.base_version != catalog.version {
+                    return Err(format!(
+                        "WAL version gap: catalog={}, record base={}",
+                        catalog.version, record.base_version
+                    ));
+                }
+                for durable in record.statements {
+                    let statement = match durable {
+                        DurableStatement::Sql(sql) => parse_sql(&sql)
+                            .map_err(|error| format!("Failed to parse WAL statement: {error}"))?,
+                        DurableStatement::Bound(statement) => *statement,
+                    };
+                    let schema_statement = is_schema_statement(&statement);
+                    let result = Executor::execute_catalog(catalog, statement);
+                    if let ExecutionResult::Error(error) = result {
+                        return Err(format!("Failed to replay WAL statement: {error}"));
+                    }
+                    if schema_statement {
+                        catalog.schema_version = catalog.schema_version.saturating_add(1);
+                    }
+                }
+                catalog.version = record.commit_version;
+                continue;
+            }
+
+            // v1 used the same checksummed transaction envelope with raw SQL strings.
+            if let Ok(record) = serde_json::from_str::<LegacyWalRecord>(&line) {
+                if record.format_version != 1
+                    || record.checksum
+                        != legacy_wal_checksum(
+                            record.base_version,
+                            record.commit_version,
+                            &record.statements,
+                        )
+                {
                     break;
                 }
                 if record.commit_version <= catalog.version {
@@ -477,6 +583,7 @@ impl SQLDatabase {
             format_version: CATALOG_FORMAT_VERSION,
             catalog_version: catalog.version,
             schema_version: catalog.schema_version,
+            timestamp_millis: now_millis(),
             tables: catalog.owned_tables(),
         };
         let encoded = serde_json::to_vec_pretty(&snapshot)
@@ -499,15 +606,17 @@ impl SQLDatabase {
             .map_err(|_| "WAL lock poisoned".to_string())?;
         if wal.is_some() {
             let wal_path = self.inner.config.data_dir.join("sql_wal.log");
-            let truncated = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&wal_path)
-                .map_err(|error| format!("Failed to truncate WAL: {error}"))?;
-            truncated
-                .sync_all()
-                .map_err(|error| format!("Failed to sync empty WAL: {error}"))?;
+            *wal = None;
+            if fs::metadata(&wal_path).is_ok_and(|metadata| metadata.len() > 0) {
+                let archive = self.inner.config.data_dir.join("wal_archive").join("sql");
+                fs::create_dir_all(&archive)
+                    .map_err(|error| format!("Failed to create SQL WAL archive: {error}"))?;
+                fs::rename(
+                    &wal_path,
+                    archive.join(format!("sql-{}-{}.wal", catalog.version, now_millis())),
+                )
+                .map_err(|error| format!("Failed to archive SQL WAL: {error}"))?;
+            }
             *wal = Some(
                 OpenOptions::new()
                     .create(true)
@@ -546,6 +655,10 @@ impl SQLDatabase {
             .map(|table| table.rows.len())
     }
 
+    pub fn current_version(&self) -> u64 {
+        self.inner.executor.snapshot().version
+    }
+
     pub fn executor(&self) -> &Executor {
         &self.inner.executor
     }
@@ -560,7 +673,7 @@ impl Default for SQLDatabase {
 struct TransactionState {
     base_version: u64,
     catalog: Catalog,
-    statements: Vec<String>,
+    statements: Vec<DurableStatement>,
     schema_changed: bool,
 }
 
@@ -574,6 +687,68 @@ pub enum SessionTransactionState {
 pub struct SQLSession {
     database: SQLDatabase,
     transaction: Mutex<Option<TransactionState>>,
+    variables: Mutex<HashMap<String, Value>>,
+    prepared: Mutex<HashMap<String, PreparedStatement>>,
+}
+
+/// A parsed, parameterized statement that can be safely executed repeatedly.
+#[derive(Debug, Clone)]
+pub struct PreparedStatement {
+    sql: String,
+    statement: Statement,
+    parameter_count: usize,
+    schema_version: u64,
+}
+
+impl PreparedStatement {
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+    pub fn parameter_count(&self) -> usize {
+        self.parameter_count
+    }
+}
+
+#[cfg(feature = "server")]
+fn prepared_expression_type(expression: &Expr, source_table: Option<&Table>) -> DataType {
+    match expression {
+        Expr::Literal(value) => value.data_type(),
+        Expr::Column { name, .. } => source_table
+            .and_then(|table| table.schema.column(name))
+            .map(|column| column.data_type.clone())
+            .unwrap_or(DataType::Text),
+        Expr::Binary { left, op, right } => match op {
+            BinaryOp::Compare(_) | BinaryOp::And | BinaryOp::Or => DataType::Boolean,
+            BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply | BinaryOp::Divide => {
+                let left = prepared_expression_type(left, source_table);
+                let right = prepared_expression_type(right, source_table);
+                match (left, right) {
+                    (DataType::Float, _) | (_, DataType::Float) => DataType::Float,
+                    (DataType::Integer, DataType::Integer) => DataType::Integer,
+                    (DataType::Null, data_type) | (data_type, DataType::Null) => data_type,
+                    _ => DataType::Text,
+                }
+            }
+        },
+        Expr::Unary { op, expr } => match op {
+            UnaryOp::Not => DataType::Boolean,
+            UnaryOp::Negate | UnaryOp::Plus => prepared_expression_type(expr, source_table),
+        },
+        Expr::IsNull { .. }
+        | Expr::Like { .. }
+        | Expr::InList { .. }
+        | Expr::InSubquery { .. }
+        | Expr::Exists { .. } => DataType::Boolean,
+        Expr::Aggregate { function, expr, .. } => match function {
+            AggregateFunction::Count => DataType::Integer,
+            AggregateFunction::Avg => DataType::Float,
+            AggregateFunction::Sum | AggregateFunction::Min | AggregateFunction::Max => expr
+                .as_deref()
+                .map(|expr| prepared_expression_type(expr, source_table))
+                .unwrap_or(DataType::Text),
+        },
+        Expr::Parameter(_) | Expr::Incoming(_) | Expr::ScalarSubquery(_) => DataType::Text,
+    }
 }
 
 impl SQLSession {
@@ -586,6 +761,89 @@ impl SQLSession {
             Statement::Begin => return self.begin(),
             Statement::Commit => return self.commit(),
             Statement::Rollback => return self.rollback(),
+            Statement::SetVariable { name, value } => {
+                self.variables
+                    .lock()
+                    .expect("variable lock poisoned")
+                    .insert(name, value);
+                return ExecutionResult::RowsAffected(0);
+            }
+            Statement::Prepare { name, source } => {
+                let sql = match source {
+                    PrepareSource::Sql(sql) => sql,
+                    PrepareSource::Variable(variable) => match self
+                        .variables
+                        .lock()
+                        .expect("variable lock poisoned")
+                        .get(&variable)
+                        .cloned()
+                    {
+                        Some(Value::Text(sql)) => sql,
+                        Some(_) => {
+                            return ExecutionResult::Error(format!(
+                                "User variable '@{variable}' must contain SQL text"
+                            ));
+                        }
+                        None => {
+                            return ExecutionResult::Error(format!(
+                                "User variable '@{variable}' is not set"
+                            ));
+                        }
+                    },
+                };
+                return match self.prepare(&sql) {
+                    Ok(prepared) => {
+                        self.prepared
+                            .lock()
+                            .expect("prepared lock poisoned")
+                            .insert(name, prepared);
+                        ExecutionResult::RowsAffected(0)
+                    }
+                    Err(error) => ExecutionResult::Error(error),
+                };
+            }
+            Statement::ExecutePrepared { name, using } => {
+                let Some(prepared) = self
+                    .prepared
+                    .lock()
+                    .expect("prepared lock poisoned")
+                    .get(&name)
+                    .cloned()
+                else {
+                    return ExecutionResult::Error(format!(
+                        "Prepared statement '{name}' does not exist"
+                    ));
+                };
+                let variables = self.variables.lock().expect("variable lock poisoned");
+                let parameters = match using
+                    .iter()
+                    .map(|name| {
+                        variables
+                            .get(name)
+                            .cloned()
+                            .ok_or_else(|| format!("User variable '@{name}' is not set"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(parameters) => parameters,
+                    Err(error) => return ExecutionResult::Error(error),
+                };
+                drop(variables);
+                return self.execute_prepared(&prepared, &parameters);
+            }
+            Statement::DeallocatePrepared { name } => {
+                return if self
+                    .prepared
+                    .lock()
+                    .expect("prepared lock poisoned")
+                    .remove(&name)
+                    .is_some()
+                {
+                    ExecutionResult::RowsAffected(0)
+                } else {
+                    ExecutionResult::Error(format!("Prepared statement '{name}' does not exist"))
+                };
+            }
             _ => {}
         }
 
@@ -593,7 +851,9 @@ impl SQLSession {
         if let Some(state) = transaction.as_mut() {
             let result = Executor::execute_catalog(&mut state.catalog, statement.clone());
             if !matches!(result, ExecutionResult::Error(_)) && is_write_statement(&statement) {
-                state.statements.push(sql.trim().to_string());
+                state
+                    .statements
+                    .push(DurableStatement::Sql(sql.trim().to_string()));
                 state.schema_changed |= is_schema_statement(&statement);
             }
             result
@@ -601,6 +861,113 @@ impl SQLSession {
             drop(transaction);
             self.database.execute_autocommit(sql, statement)
         }
+    }
+
+    pub fn prepare(&self, sql: &str) -> Result<PreparedStatement, String> {
+        let statement = self.database.parse_cached(sql)?;
+        if is_transaction_control(&statement) || is_session_statement(&statement) {
+            return Err("Transaction/session control statements cannot be prepared".to_string());
+        }
+        Ok(PreparedStatement {
+            sql: sql.trim().to_string(),
+            parameter_count: parameter_count(&statement),
+            schema_version: self.database.inner.executor.snapshot().schema_version,
+            statement,
+        })
+    }
+
+    pub fn execute_prepared(
+        &self,
+        prepared: &PreparedStatement,
+        parameters: &[Value],
+    ) -> ExecutionResult {
+        let schema_version = self.database.inner.executor.snapshot().schema_version;
+        let statement = if schema_version == prepared.schema_version {
+            prepared.statement.clone()
+        } else {
+            match self.database.parse_cached(&prepared.sql) {
+                Ok(statement) => statement,
+                Err(error) => return ExecutionResult::Error(error),
+            }
+        };
+        let statement = match bind_parameters(&statement, parameters) {
+            Ok(statement) => Optimizer::optimize_statement(statement),
+            Err(error) => return ExecutionResult::Error(error),
+        };
+        let mut transaction = self.transaction.lock().expect("transaction lock poisoned");
+        if let Some(state) = transaction.as_mut() {
+            let result = Executor::execute_catalog(&mut state.catalog, statement.clone());
+            if !matches!(result, ExecutionResult::Error(_)) && is_write_statement(&statement) {
+                state
+                    .statements
+                    .push(DurableStatement::Bound(Box::new(statement.clone())));
+                state.schema_changed |= is_schema_statement(&statement);
+            }
+            result
+        } else {
+            drop(transaction);
+            self.database.execute_autocommit_durable(
+                DurableStatement::Bound(Box::new(statement.clone())),
+                statement,
+            )
+        }
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn prepared_result_metadata(
+        &self,
+        prepared: &PreparedStatement,
+        parameters: Option<&[Value]>,
+    ) -> Vec<(String, DataType)> {
+        let bound_statement = parameters
+            .and_then(|values| bind_parameters(&prepared.statement, values).ok())
+            .unwrap_or_else(|| prepared.statement.clone());
+        let Statement::Query(query) = &bound_statement else {
+            return Vec::new();
+        };
+        let catalog = self.database.inner.executor.snapshot();
+        let source_table = match &query.from {
+            Some(TableSource::Table { name, alias }) => catalog
+                .tables
+                .get(name)
+                .map(|table| (table, alias.as_deref().unwrap_or(name.as_str()))),
+            _ => None,
+        };
+        let mut result = Vec::new();
+        for item in &query.projection {
+            match item {
+                SelectItem::Wildcard(qualifier) => {
+                    if let Some((table, visible_name)) = source_table
+                        && qualifier
+                            .as_deref()
+                            .is_none_or(|name| name.eq_ignore_ascii_case(visible_name))
+                    {
+                        result.extend(
+                            table
+                                .schema
+                                .columns
+                                .iter()
+                                .map(|column| (column.name.clone(), column.data_type.clone())),
+                        );
+                    }
+                }
+                SelectItem::Expr { expr, alias } => {
+                    let name = alias.clone().unwrap_or_else(|| match expr {
+                        Expr::Column { name, .. } => name.clone(),
+                        Expr::Aggregate { function, .. } => {
+                            format!("{function:?}").to_ascii_lowercase()
+                        }
+                        _ => "expression".to_string(),
+                    });
+                    let data_type = prepared_expression_type(
+                        expr,
+                        source_table.map(|(table, _)| table.as_ref()),
+                    );
+                    result.push((name, data_type));
+                }
+            }
+        }
+        result
     }
 
     pub fn begin(&self) -> ExecutionResult {
@@ -702,6 +1069,17 @@ fn is_schema_statement(statement: &Statement) -> bool {
             | Statement::DropTable { .. }
             | Statement::CreateIndex { .. }
             | Statement::DropIndex { .. }
+            | Statement::AlterTable { .. }
+    )
+}
+
+fn is_session_statement(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::SetVariable { .. }
+            | Statement::Prepare { .. }
+            | Statement::ExecutePrepared { .. }
+            | Statement::DeallocatePrepared { .. }
     )
 }
 
@@ -736,6 +1114,187 @@ mod tests {
             }
             result => panic!("unexpected result: {result:?}"),
         }
+    }
+
+    #[test]
+    fn alter_insert_select_and_upsert_are_atomic() {
+        let database = SQLDatabase::new();
+        assert!(!matches!(
+            database.execute("CREATE TABLE source (id INT PRIMARY KEY, name TEXT)"),
+            ExecutionResult::Error(_)
+        ));
+        assert!(!matches!(
+            database.execute("CREATE TABLE target (id INT PRIMARY KEY, name TEXT)"),
+            ExecutionResult::Error(_)
+        ));
+        assert!(!matches!(
+            database.execute("INSERT INTO source VALUES (1, 'one'), (2, 'two')"),
+            ExecutionResult::Error(_)
+        ));
+        assert!(matches!(
+            database.execute("INSERT INTO target SELECT id, name FROM source"),
+            ExecutionResult::RowsAffected(2)
+        ));
+        assert!(matches!(
+            database.execute(
+                "INSERT INTO target VALUES (2, 'deux') ON DUPLICATE KEY UPDATE name = VALUES(name)"
+            ),
+            ExecutionResult::RowsAffected(2)
+        ));
+        assert!(!matches!(
+            database.execute("ALTER TABLE target ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT TRUE"),
+            ExecutionResult::Error(_)
+        ));
+        assert!(!matches!(
+            database.execute("ALTER TABLE target RENAME COLUMN enabled TO active"),
+            ExecutionResult::Error(_)
+        ));
+        assert!(matches!(
+            database.execute("ALTER TABLE target MODIFY COLUMN id TEXT"),
+            ExecutionResult::Error(_)
+        ));
+        let ExecutionResult::Select(result) =
+            database.execute("SELECT name, active FROM target WHERE id = 2")
+        else {
+            panic!("expected rows");
+        };
+        assert_eq!(
+            result.rows[0].values,
+            vec![Value::Text("deux".to_string()), Value::Boolean(true)]
+        );
+    }
+
+    #[test]
+    fn multi_row_upsert_maintains_unique_indexes_incrementally() {
+        let database = SQLDatabase::new();
+        assert!(!matches!(
+            database.execute(
+                "CREATE TABLE indexed_upsert (id INT PRIMARY KEY, email TEXT UNIQUE, hits INT)"
+            ),
+            ExecutionResult::Error(_)
+        ));
+        assert!(matches!(
+            database.execute("INSERT INTO indexed_upsert VALUES (1, 'a', 0)"),
+            ExecutionResult::RowsAffected(1)
+        ));
+        assert!(matches!(
+            database.execute(
+                "INSERT INTO indexed_upsert VALUES (2, 'b', 1), (3, 'c', 1), (4, 'b', 1) \
+                 ON DUPLICATE KEY UPDATE hits = hits + VALUES(hits)"
+            ),
+            ExecutionResult::RowsAffected(4)
+        ));
+        assert!(matches!(
+            database.execute(
+                "INSERT INTO indexed_upsert VALUES (1, 'z', 1), (5, 'z', 1) \
+                 ON DUPLICATE KEY UPDATE email = VALUES(email), hits = hits + VALUES(hits)"
+            ),
+            ExecutionResult::RowsAffected(4)
+        ));
+
+        let ExecutionResult::Select(result) =
+            database.execute("SELECT id, email, hits FROM indexed_upsert ORDER BY id")
+        else {
+            panic!("expected rows");
+        };
+        assert_eq!(
+            result
+                .rows
+                .iter()
+                .map(|row| row.values.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                vec![
+                    Value::Integer(1),
+                    Value::Text("z".to_string()),
+                    Value::Integer(2),
+                ],
+                vec![
+                    Value::Integer(2),
+                    Value::Text("b".to_string()),
+                    Value::Integer(2),
+                ],
+                vec![
+                    Value::Integer(3),
+                    Value::Text("c".to_string()),
+                    Value::Integer(1),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn prepared_statements_bind_without_interpolation_and_replay() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().to_str().unwrap();
+        {
+            let database = SQLDatabase::open(path).unwrap();
+            database.execute("CREATE TABLE prepared (id INT PRIMARY KEY, value TEXT)");
+            let session = database.session();
+            let prepared = session
+                .prepare("INSERT INTO prepared VALUES (?, ?)")
+                .unwrap();
+            assert_eq!(prepared.parameter_count(), 2);
+            assert!(matches!(
+                session.execute_prepared(
+                    &prepared,
+                    &[Value::Integer(1), Value::Text("safe ' value".to_string())]
+                ),
+                ExecutionResult::RowsAffected(1)
+            ));
+            assert!(!matches!(
+                session.execute("SET @id = 2"),
+                ExecutionResult::Error(_)
+            ));
+            assert!(!matches!(
+                session.execute("SET @value = 'second'"),
+                ExecutionResult::Error(_)
+            ));
+            assert!(!matches!(
+                session.execute("PREPARE add_row FROM 'INSERT INTO prepared VALUES (?, ?)'"),
+                ExecutionResult::Error(_)
+            ));
+            assert!(matches!(
+                session.execute("EXECUTE add_row USING @id, @value"),
+                ExecutionResult::RowsAffected(1)
+            ));
+            assert!(!matches!(
+                session.execute("DEALLOCATE PREPARE add_row"),
+                ExecutionResult::Error(_)
+            ));
+        }
+        let database = SQLDatabase::open(path).unwrap();
+        assert_eq!(database.table_row_count("prepared"), Some(2));
+    }
+
+    #[test]
+    fn alter_constraints_validate_existing_and_future_rows() {
+        let database = SQLDatabase::new();
+        database.execute("CREATE TABLE parent (id INT PRIMARY KEY)");
+        database.execute("CREATE TABLE child (id INT PRIMARY KEY, parent_id INT, label TEXT)");
+        database.execute("INSERT INTO parent VALUES (1)");
+        database.execute("INSERT INTO child VALUES (1, 1, 'a')");
+        assert!(!matches!(database.execute("ALTER TABLE child ADD CONSTRAINT fk_parent FOREIGN KEY (parent_id) REFERENCES parent(id)"), ExecutionResult::Error(_)));
+        assert!(matches!(
+            database.execute("INSERT INTO child VALUES (2, 9, 'b')"),
+            ExecutionResult::Error(_)
+        ));
+        assert!(!matches!(
+            database.execute("ALTER TABLE child ADD CONSTRAINT uq_label UNIQUE (label)"),
+            ExecutionResult::Error(_)
+        ));
+        assert!(matches!(
+            database.execute("INSERT INTO child VALUES (2, 1, 'a')"),
+            ExecutionResult::Error(_)
+        ));
+        assert!(!matches!(
+            database.execute("ALTER TABLE child DROP FOREIGN KEY fk_parent"),
+            ExecutionResult::Error(_)
+        ));
+        assert!(matches!(
+            database.execute("INSERT INTO child VALUES (2, 9, 'b')"),
+            ExecutionResult::RowsAffected(1)
+        ));
     }
 
     #[test]

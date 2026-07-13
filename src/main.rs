@@ -1,9 +1,13 @@
 use rustydb::{KVStore, RUSTYDB_VERSION, SQLDatabase, print_outdated_version_warning};
 use std::env;
 use std::io::{self, Write};
+use std::path::PathBuf;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    if run_recovery_command(&args) {
+        return;
+    }
     let use_memory_only = args.iter().any(|a| a == "--memory");
     let use_sql_mode = args.iter().any(|a| a == "--sql");
     let use_server_mode = args.iter().any(|a| a == "--server");
@@ -37,6 +41,82 @@ fn main() {
     } else {
         run_kv_mode(data_dir, use_memory_only);
     }
+}
+
+fn run_recovery_command(args: &[String]) -> bool {
+    let Some(command) = args.get(1).map(String::as_str) else {
+        return false;
+    };
+    if !matches!(command, "backup" | "restore" | "wal-prune") {
+        return false;
+    }
+    let option = |name: &str| {
+        args.iter().find_map(|argument| {
+            argument
+                .strip_prefix(&format!("--{name}="))
+                .map(str::to_string)
+        })
+    };
+    let result: Result<String, String> = match command {
+        "backup" => (|| {
+            let data = option("data").unwrap_or_else(|| "./rustydb_data".to_string());
+            let output =
+                option("output").ok_or_else(|| "backup requires --output=DIR".to_string())?;
+            let manifest = rustydb::BackupManager::create(data, output)?;
+            Ok(format!(
+                "Backup complete at recovery point sql:{},kv:{}",
+                manifest.recovery_point.sql_commit_version, manifest.recovery_point.kv_sequence
+            ))
+        })(),
+        "restore" => (|| {
+            let backup =
+                option("backup").ok_or_else(|| "restore requires --backup=DIR".to_string())?;
+            let output =
+                option("output").ok_or_else(|| "restore requires --output=DIR".to_string())?;
+            let archive = option("wal-archive").map(PathBuf::from);
+            if option("target-time").is_some() && option("target-point").is_some() {
+                return Err("Choose only one of --target-time or --target-point".to_string());
+            }
+            let target = if let Some(timestamp) = option("target-time") {
+                rustydb::RecoveryTarget::Timestamp(rustydb::parse_rfc3339(&timestamp)?)
+            } else if let Some(point) = option("target-point") {
+                rustydb::RecoveryTarget::Point(point.parse()?)
+            } else {
+                rustydb::RecoveryTarget::Latest
+            };
+            let point =
+                rustydb::BackupManager::restore(backup, archive.as_deref(), output, target)?;
+            Ok(format!(
+                "Restore complete at recovery point sql:{},kv:{}",
+                point.sql_commit_version, point.kv_sequence
+            ))
+        })(),
+        "wal-prune" => (|| {
+            let data = option("data").unwrap_or_else(|| "./rustydb_data".to_string());
+            let before = option("before")
+                .ok_or_else(|| "wal-prune requires --before=RFC3339".to_string())?;
+            let apply = args.iter().any(|argument| argument == "--yes");
+            let report =
+                rustydb::BackupManager::prune(data, rustydb::parse_rfc3339(&before)?, apply)?;
+            Ok(format!(
+                "{} {} WAL segment(s), {} bytes{}",
+                if apply { "Pruned" } else { "Would prune" },
+                report.files.len(),
+                report.bytes,
+                if apply {
+                    ""
+                } else {
+                    " (dry run; pass --yes to apply)"
+                }
+            ))
+        })(),
+        _ => unreachable!(),
+    };
+    match result {
+        Ok(message) => println!("{message}"),
+        Err(error) => eprintln!("Error: {error}"),
+    }
+    true
 }
 
 #[cfg(feature = "server")]

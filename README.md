@@ -33,6 +33,9 @@ Connect with any standard MySQL client -- `mysql` CLI, Python (`mysql-connector-
 - **Composite B-tree indexes**, `CREATE/DROP INDEX`, `SHOW INDEXES`, and `EXPLAIN`
 - **Three-valued NULL logic**, qualified columns, aliases, ordering, and limits
 - **PRIMARY KEY, UNIQUE, CHECK, and RESTRICT foreign-key constraints**
+- **Atomic `ALTER TABLE` migrations** for columns, types, defaults, nullability, and constraints
+- **`INSERT ... SELECT` and `ON DUPLICATE KEY UPDATE` upserts**
+- **SQL and MySQL binary-protocol prepared statements** with typed parameters
 - **Optimistic serializable transactions** with `BEGIN`, `COMMIT`, and `ROLLBACK`
 - **Rule optimizer** with predicate pushdown, projection pruning, constant folding, hash-join selection, index selection, and Top-N sorting
 - **Data types**: INTEGER, FLOAT, TEXT, BOOLEAN, NULL
@@ -53,7 +56,9 @@ Connect with any standard MySQL client -- `mysql` CLI, Python (`mysql-connector-
 - **Configurable flush intervals**
 - **Snapshot compaction**
 - **Versioned, checksummed committed-transaction SQL WAL**
+- **Versioned, checksummed, timestamped KV WAL** with ordered sequence numbers
 - **Atomic single-catalog snapshots**
+- **Immutable WAL archives, combined backups, restore, and point-in-time recovery**
 - **Automatic migration of legacy per-table JSON files**
 
 #### Network Interfaces
@@ -66,6 +71,7 @@ Connect with any standard MySQL client -- `mysql` CLI, Python (`mysql-connector-
 - Key-Value REPL mode (default)
 - Interactive SQL REPL mode (`--sql`)
 - Server mode (`--server`) with HTTP + TCP
+- Offline `backup`, `restore`, and `wal-prune` administration commands
 
 ## Quick Start
 
@@ -96,6 +102,15 @@ cargo run --release -- --data=/path/to/data --sql
 
 # Run in memory-only mode (no persistence)
 cargo run --release -- --memory --sql
+
+# Back up both engines (the data directory must not be active)
+cargo run --release -- backup --data=./rustydb_data --output=./backups/backup-1
+
+# Restore through later WAL archives to an exact composite point
+cargo run --release -- restore --backup=./backups/backup-1 --wal-archive=./rustydb_data/wal_archive --output=./restored --target-point=sql:42,kv:108
+
+# Preview archive pruning; add --yes to apply it
+cargo run --release -- wal-prune --data=./rustydb_data --before=2026-07-01T00:00:00Z
 ```
 
 ### Server Mode
@@ -392,8 +407,8 @@ Authentication uses HTTP Basic Auth when `RUSTYDB_USERNAME` and `RUSTYDB_PASSWOR
 
 ### Supported SQL
 
-- **DDL**: `CREATE TABLE`, `DROP TABLE`, `CREATE [UNIQUE] INDEX`, `DROP INDEX`, `DESCRIBE`, `SHOW TABLES`, `SHOW INDEXES`, `EXPLAIN`
-- **DML**: `INSERT`, `SELECT`, `UPDATE`, `DELETE`
+- **DDL**: `CREATE/DROP TABLE`, atomic `ALTER TABLE` column/type/default/nullability/constraint changes, `CREATE/DROP INDEX`, `DESCRIBE`, `SHOW TABLES`, `SHOW INDEXES`, `EXPLAIN`
+- **DML**: `INSERT`, `INSERT ... SELECT`, `ON DUPLICATE KEY UPDATE`, `SELECT`, `UPDATE`, `DELETE`
 - **Data Types**: `INTEGER`/`INT`, `FLOAT`/`DOUBLE`, `TEXT`/`VARCHAR(n)`, `BOOLEAN`/`BOOL`, `NULL`
 - **Queries**: qualified columns, aliases, `INNER`/`LEFT`/`RIGHT JOIN`, derived tables, non-recursive CTEs
 - **Subqueries**: uncorrelated scalar, `IN`, and `EXISTS`
@@ -402,19 +417,20 @@ Authentication uses HTTP Basic Auth when `RUSTYDB_USERNAME` and `RUSTYDB_PASSWOR
 - **Ordering**: `ORDER BY column [ASC|DESC]`
 - **Limits**: `LIMIT n`
 - **Transactions**: connection-local `BEGIN`, `COMMIT`, and `ROLLBACK`
+- **Prepared statements**: `SET @var`, `PREPARE ... FROM`, `EXECUTE ... USING`, and `DEALLOCATE/DROP PREPARE`
 - **Constraints**: `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, `CHECK`, composite `FOREIGN KEY` with `RESTRICT`
 - **Pattern Matching**: `LIKE` with `%` (any chars) and `_` (single char)
 
-Unsupported in this release: correlated/recursive subqueries, recursive CTEs, window functions, lateral/full joins, foreign-key cascades, and `ALTER TABLE` constraint changes.
+Unsupported in this release: correlated/recursive subqueries, recursive CTEs, window functions, lateral/full joins, foreign-key cascades, constraint renaming, and lossy ALTER conversions.
 
 ### MySQL Wire Protocol
 
 RustyDB implements the MySQL client/server protocol v10, allowing standard MySQL clients to connect directly:
 
 - **Handshake**: Server greeting with `mysql_native_password` authentication
-- **Commands**: `COM_QUERY`, `COM_PING`, `COM_QUIT`, `COM_INIT_DB`, `COM_FIELD_LIST`
+- **Commands**: `COM_QUERY`, `COM_PING`, `COM_QUIT`, `COM_INIT_DB`, `COM_FIELD_LIST`, and `COM_STMT_PREPARE/EXECUTE/RESET/CLOSE/SEND_LONG_DATA`
 - **System queries**: `SET`, `USE`, `SELECT @@variables`, `SHOW DATABASES`, transaction control
-- **Result encoding**: Text protocol with column definitions and row data
+- **Result encoding**: text rows plus prepared-statement binary rows and prepare-time metadata
 - **Transactions**: each wire connection owns an isolated SQL session
 - **Reports as**: `5.7.99-RustyDB-0.3.0-beta`
 
@@ -423,12 +439,13 @@ RustyDB implements the MySQL client/server protocol v10, allowing standard MySQL
 RustyDB uses a dual-persistence approach:
 
 #### Key-Value Persistence
-- **Write-Ahead Log (WAL)**: Every write appended to `rustydb.wal` with `fsync()`
-- **Snapshots**: Compact representation in `rustydb.db` with atomic rename
+- **Write-Ahead Log (WAL)**: ordered, timestamped, checksummed records in `rustydb.wal`
+- **Snapshots**: versioned state in `rustydb.db` with atomic rename
 
 #### SQL Persistence
 - **Catalog snapshot**: tables, schemas, constraints, stable row IDs, and index metadata in `catalog.json`
-- **SQL WAL**: versioned and checksummed committed-transaction records in `sql_wal.log`
+- **SQL WAL**: versioned, timestamped, checksummed committed-transaction records in `sql_wal.log`
+- **Archives**: checkpoints rotate both active WALs under `wal_archive/` instead of deleting recovery history
 - **Legacy migration**: old `tables/*.json` files are imported when no catalog exists and are retained for safety
 
 ```
@@ -439,6 +456,10 @@ rustydb_data/
 ├── catalog.json       # Atomic SQL catalog snapshot
 └── tables/            # Optional retained v0.2 legacy files
 ```
+
+Checkpoints also create `wal_archive/sql/` and `wal_archive/kv/` directories containing immutable recovery segments.
+
+Backups and restores are deliberately offline. Engine-level advisory locks reject an operation while either persisted engine is active. A backup contains checksummed base files, included archives, and a manifest with the composite recovery point `{sql_commit_version, kv_sequence}`. Timestamp recovery accepts RFC 3339; exact recovery requires both composite values. Archive pruning is always a dry run unless `--yes` is supplied, so copy required backup and WAL material off-host before pruning.
 
 ## Environment Variables
 

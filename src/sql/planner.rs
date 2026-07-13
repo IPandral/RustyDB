@@ -17,13 +17,27 @@ impl Optimizer {
             Statement::Insert {
                 table_name,
                 columns,
-                values,
+                source,
+                on_duplicate,
             } => Statement::Insert {
                 table_name,
                 columns,
-                values: values
+                source: match source {
+                    super::parser::InsertSource::Values(values) => {
+                        super::parser::InsertSource::Values(
+                            values
+                                .into_iter()
+                                .map(|row| row.into_iter().map(fold_expr).collect())
+                                .collect(),
+                        )
+                    }
+                    super::parser::InsertSource::Query(query) => {
+                        super::parser::InsertSource::Query(Box::new(Self::optimize_query(*query)))
+                    }
+                },
+                on_duplicate: on_duplicate
                     .into_iter()
-                    .map(|row| row.into_iter().map(fold_expr).collect())
+                    .map(|(column, expression)| (column, fold_expr(expression)))
                     .collect(),
             },
             Statement::Update {

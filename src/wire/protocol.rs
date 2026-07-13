@@ -19,6 +19,9 @@ pub const SERVER_STATUS_IN_TRANS: u16 = 0x0001;
 
 // MySQL Column Types
 pub const MYSQL_TYPE_TINY: u8 = 0x01;
+pub const MYSQL_TYPE_SHORT: u8 = 0x02;
+pub const MYSQL_TYPE_LONG: u8 = 0x03;
+pub const MYSQL_TYPE_FLOAT: u8 = 0x04;
 pub const MYSQL_TYPE_DOUBLE: u8 = 0x05;
 pub const MYSQL_TYPE_LONGLONG: u8 = 0x08;
 pub const MYSQL_TYPE_VAR_STRING: u8 = 0xFD;
@@ -35,6 +38,11 @@ pub const COM_INIT_DB: u8 = 0x02;
 pub const COM_QUERY: u8 = 0x03;
 pub const COM_FIELD_LIST: u8 = 0x04;
 pub const COM_PING: u8 = 0x0E;
+pub const COM_STMT_PREPARE: u8 = 0x16;
+pub const COM_STMT_EXECUTE: u8 = 0x17;
+pub const COM_STMT_SEND_LONG_DATA: u8 = 0x18;
+pub const COM_STMT_CLOSE: u8 = 0x19;
+pub const COM_STMT_RESET: u8 = 0x1A;
 
 // Server version - report as MySQL 5.7 so clients default to mysql_native_password
 pub const SERVER_VERSION: &str = "5.7.99-RustyDB-0.3.0-beta";
@@ -102,7 +110,7 @@ pub fn read_null_terminated(data: &[u8], pos: &mut usize) -> String {
     s
 }
 
-fn read_lenenc_int(data: &[u8], pos: &mut usize) -> Option<u64> {
+pub fn read_lenenc_int(data: &[u8], pos: &mut usize) -> Option<u64> {
     if *pos >= data.len() {
         return None;
     }
@@ -384,6 +392,41 @@ pub fn build_text_row(values: &[&Value]) -> Vec<u8> {
         }
     }
     pkt
+}
+
+/// Initial response to COM_STMT_PREPARE.
+pub fn build_stmt_prepare_ok(statement_id: u32, columns: u16, parameters: u16) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(12);
+    packet.push(0x00);
+    packet.extend_from_slice(&statement_id.to_le_bytes());
+    packet.extend_from_slice(&columns.to_le_bytes());
+    packet.extend_from_slice(&parameters.to_le_bytes());
+    packet.push(0);
+    packet.extend_from_slice(&0u16.to_le_bytes());
+    packet
+}
+
+/// Build one MySQL binary-protocol result row.
+pub fn build_binary_row(values: &[Value]) -> Vec<u8> {
+    let mut packet = vec![0x00];
+    let bitmap_len = (values.len() + 9) / 8;
+    let bitmap_start = packet.len();
+    packet.resize(packet.len() + bitmap_len, 0);
+    for (index, value) in values.iter().enumerate() {
+        if value.is_null() {
+            let bit = index + 2;
+            packet[bitmap_start + bit / 8] |= 1 << (bit % 8);
+            continue;
+        }
+        match value {
+            Value::Integer(value) => packet.extend_from_slice(&value.to_le_bytes()),
+            Value::Float(value) => packet.extend_from_slice(&value.to_le_bytes()),
+            Value::Boolean(value) => packet.push(u8::from(*value)),
+            Value::Text(value) => packet.extend_from_slice(&encode_lenenc_str(value)),
+            Value::Null => unreachable!(),
+        }
+    }
+    packet
 }
 
 /// Map RustyDB DataType to MySQL column type code.

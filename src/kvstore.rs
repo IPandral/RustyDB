@@ -195,6 +195,17 @@ impl KVStore {
         }
     }
 
+    pub fn current_sequence(&self) -> Result<u64, String> {
+        let guard = self
+            .persistence
+            .lock()
+            .map_err(|e| format!("Lock error: {e}"))?;
+        Ok(guard
+            .as_ref()
+            .map(PersistenceManager::current_sequence)
+            .unwrap_or(0))
+    }
+
     /// Flushes any pending async writes to disk
     pub fn flush(&self) -> Result<(), String> {
         let guard = self

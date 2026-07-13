@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, RwLock};
 
-use super::parser::Statement;
+use super::parser::{AlterOperation, InsertSource, Statement};
 use super::planner::Planner;
 use super::types::*;
 
@@ -230,18 +230,133 @@ impl Table {
             .collect()
     }
 
-    fn insert_rows(&mut self, rows: Vec<Row>) -> Result<usize, String> {
-        for row in &rows {
-            self.schema.validate_row(&row.values)?;
+    fn insert_row_indexed(&mut self, row: Row) -> Result<(), String> {
+        self.schema.validate_row(&row.values)?;
+        let position = self.rows.len();
+        let row_id = self.next_row_id;
+        let primary_key = self
+            .schema
+            .primary_key_index()
+            .and_then(|index| row.values.get(index))
+            .map(ToString::to_string);
+        let index_keys: Vec<_> = self
+            .indexes
+            .iter()
+            .filter_map(|(name, index)| {
+                self.index_key(&row, &index.definition.columns)
+                    .map(|key| (name.clone(), key))
+            })
+            .collect();
+
+        self.rows.push(row);
+        self.row_ids.push(row_id);
+        self.next_row_id = self.next_row_id.saturating_add(1);
+        if let Some(primary_key) = primary_key {
+            self.primary_key_index.insert(primary_key, position);
         }
-        let count = rows.len();
-        for row in rows {
-            self.rows.push(row);
-            self.row_ids.push(self.next_row_id);
-            self.next_row_id = self.next_row_id.saturating_add(1);
+        for (name, key) in index_keys {
+            if let Some(index) = self.indexes.get_mut(&name) {
+                index.entries.entry(key.clone()).or_default().insert(row_id);
+                index.bloom.insert(&key);
+            }
         }
-        self.rebuild_index();
-        Ok(count)
+        Ok(())
+    }
+
+    fn replace_row_indexed(&mut self, position: usize, row: Row) -> Result<(), String> {
+        self.schema.validate_row(&row.values)?;
+        let Some(previous) = self.rows.get(position).cloned() else {
+            return Err("Row position is out of bounds".to_string());
+        };
+        let row_id = self
+            .row_ids
+            .get(position)
+            .copied()
+            .ok_or_else(|| "Row ID is unavailable".to_string())?;
+        let primary_index = self.schema.primary_key_index();
+        let previous_primary = primary_index
+            .and_then(|index| previous.values.get(index))
+            .map(ToString::to_string);
+        let next_primary = primary_index
+            .and_then(|index| row.values.get(index))
+            .map(ToString::to_string);
+        let index_changes: Vec<_> = self
+            .indexes
+            .iter()
+            .map(|(name, index)| {
+                (
+                    name.clone(),
+                    self.index_key(&previous, &index.definition.columns),
+                    self.index_key(&row, &index.definition.columns),
+                )
+            })
+            .collect();
+
+        self.rows[position] = row;
+        if previous_primary != next_primary {
+            if let Some(previous_primary) = previous_primary
+                && self.primary_key_index.get(&previous_primary) == Some(&position)
+            {
+                self.primary_key_index.remove(&previous_primary);
+            }
+            if let Some(next_primary) = next_primary {
+                self.primary_key_index.insert(next_primary, position);
+            }
+        }
+        for (name, previous_key, next_key) in index_changes {
+            if previous_key == next_key {
+                continue;
+            }
+            let Some(index) = self.indexes.get_mut(&name) else {
+                continue;
+            };
+            if let Some(previous_key) = previous_key {
+                let remove_entry = if let Some(row_ids) = index.entries.get_mut(&previous_key) {
+                    row_ids.remove(&row_id);
+                    row_ids.is_empty()
+                } else {
+                    false
+                };
+                if remove_entry {
+                    index.entries.remove(&previous_key);
+                }
+            }
+            if let Some(next_key) = next_key {
+                index
+                    .entries
+                    .entry(next_key.clone())
+                    .or_default()
+                    .insert(row_id);
+                index.bloom.insert(&next_key);
+            }
+        }
+        Ok(())
+    }
+
+    fn unique_conflict_positions(&self, row: &Row) -> HashSet<usize> {
+        let mut conflicts = HashSet::new();
+        for index in self
+            .indexes
+            .values()
+            .filter(|index| index.definition.unique)
+        {
+            let Some(key) = self.index_key(row, &index.definition.columns) else {
+                continue;
+            };
+            // SQL UNIQUE constraints permit multiple NULL-containing keys.
+            if key.contains(&KeyPart::Null) || !index.bloom.might_contain(&key) {
+                continue;
+            }
+            let Some(row_ids) = index.entries.get(&key) else {
+                continue;
+            };
+            for row_id in row_ids {
+                if let Ok(position) = self.row_ids.binary_search(row_id) {
+                    conflicts.insert(position);
+                }
+            }
+        }
+        conflicts
     }
 
     fn candidate_row_ids(
@@ -653,6 +768,7 @@ pub(crate) fn is_write_statement(statement: &Statement) -> bool {
             | Statement::DropTable { .. }
             | Statement::CreateIndex { .. }
             | Statement::DropIndex { .. }
+            | Statement::AlterTable { .. }
             | Statement::Insert { .. }
             | Statement::Update { .. }
             | Statement::Delete { .. }
@@ -695,11 +811,16 @@ fn execute_statement(catalog: &mut Catalog, statement: Statement) -> ExecutionRe
             table_name,
             if_exists,
         } => execute_drop_index(catalog, &name, &table_name, if_exists),
+        Statement::AlterTable {
+            table_name,
+            operations,
+        } => execute_alter_table(catalog, &table_name, operations),
         Statement::Insert {
             table_name,
             columns,
-            values,
-        } => execute_insert(catalog, &table_name, columns, values),
+            source,
+            on_duplicate,
+        } => execute_insert(catalog, &table_name, columns, source, on_duplicate),
         Statement::Query(query) => execute_query(catalog, &query, &HashMap::new())
             .map(relation_to_result)
             .map(ExecutionResult::Select)
@@ -741,6 +862,12 @@ fn execute_statement(catalog: &mut Catalog, statement: Statement) -> ExecutionRe
         Statement::Begin | Statement::Commit | Statement::Rollback => {
             ExecutionResult::Error("Transaction control requires a session".to_string())
         }
+        Statement::SetVariable { .. }
+        | Statement::Prepare { .. }
+        | Statement::ExecutePrepared { .. }
+        | Statement::DeallocatePrepared { .. } => ExecutionResult::Error(
+            "Prepared statements and user variables require a session".to_string(),
+        ),
     }
 }
 
@@ -976,13 +1103,453 @@ fn execute_drop_index(
     ExecutionResult::IndexDropped(name.to_string())
 }
 
+fn execute_alter_table(
+    catalog: &mut Catalog,
+    table_name: &str,
+    operations: Vec<AlterOperation>,
+) -> ExecutionResult {
+    let name = table_name.to_ascii_lowercase();
+    let Some(existing) = catalog.tables.get(&name) else {
+        return ExecutionResult::Error(format!("Table '{name}' does not exist"));
+    };
+    let mut table = (**existing).clone();
+
+    for operation in operations {
+        let result = apply_alter_operation(catalog, &name, &mut table, operation);
+        if let Err(error) = result {
+            return ExecutionResult::Error(error);
+        }
+    }
+    refresh_constraint_metadata(&mut table);
+    catalog.tables.insert(name, Arc::new(table));
+    ExecutionResult::RowsAffected(0)
+}
+
+fn apply_alter_operation(
+    catalog: &mut Catalog,
+    table_name: &str,
+    table: &mut Table,
+    operation: AlterOperation,
+) -> Result<(), String> {
+    match operation {
+        AlterOperation::AddColumn {
+            column,
+            constraints,
+            if_not_exists,
+        } => {
+            if table.schema.column_index(&column.name).is_some() {
+                return if if_not_exists {
+                    Ok(())
+                } else {
+                    Err(format!("Column '{}' already exists", column.name))
+                };
+            }
+            let value = column.default.clone().unwrap_or(Value::Null);
+            let value = value.coerce_to(&column.data_type).ok_or_else(|| {
+                format!(
+                    "Default for column '{}' cannot be converted to {}",
+                    column.name, column.data_type
+                )
+            })?;
+            if value.is_null() && !column.nullable && !table.rows.is_empty() {
+                return Err(format!("Column '{}' cannot be NULL", column.name));
+            }
+            for row in &mut table.rows {
+                row.values.push(value.clone());
+            }
+            table.schema.columns.push(column);
+            table.schema.constraints.extend(constraints);
+        }
+        AlterOperation::DropColumn { name, if_exists } => {
+            let Some(index) = table.schema.column_index(&name) else {
+                return if if_exists {
+                    Ok(())
+                } else {
+                    Err(format!("Column '{name}' does not exist"))
+                };
+            };
+            if table.schema.columns.len() == 1 {
+                return Err("Cannot drop the final column of a table".to_string());
+            }
+            let local_reference = table.schema.constraints.iter().any(|constraint| {
+                constraint_columns(constraint)
+                    .iter()
+                    .any(|column| column.eq_ignore_ascii_case(&name))
+            }) || table.schema.indexes.iter().any(|idx| {
+                idx.columns
+                    .iter()
+                    .any(|column| column.eq_ignore_ascii_case(&name))
+            });
+            let inbound_reference = catalog.tables.iter().any(|(other_name, other)| {
+                other_name != table_name && other.schema.constraints.iter().any(|constraint| matches!(constraint,
+                    TableConstraint::ForeignKey(fk) if fk.foreign_table.eq_ignore_ascii_case(table_name)
+                        && fk.referred_columns.iter().any(|column| column.eq_ignore_ascii_case(&name))))
+            });
+            if local_reference || inbound_reference {
+                return Err(format!(
+                    "Cannot drop column '{name}': referenced by an index or constraint"
+                ));
+            }
+            table.schema.columns.remove(index);
+            for row in &mut table.rows {
+                row.values.remove(index);
+            }
+        }
+        AlterOperation::RenameColumn { old_name, new_name } => {
+            if table.schema.column_index(&new_name).is_some() {
+                return Err(format!("Column '{new_name}' already exists"));
+            }
+            let index = table
+                .schema
+                .column_index(&old_name)
+                .ok_or_else(|| format!("Column '{old_name}' does not exist"))?;
+            table.schema.columns[index].name = new_name.clone();
+            rename_schema_references(&mut table.schema, &old_name, &new_name);
+            // Foreign keys in other tables follow a referenced-column rename.
+            for (other_name, other) in catalog.tables.clone() {
+                if other_name == table_name {
+                    continue;
+                }
+                let mut changed = false;
+                let mut other = (*other).clone();
+                for constraint in &mut other.schema.constraints {
+                    if let TableConstraint::ForeignKey(fk) = constraint
+                        && fk.foreign_table.eq_ignore_ascii_case(table_name)
+                    {
+                        for column in &mut fk.referred_columns {
+                            if column.eq_ignore_ascii_case(&old_name) {
+                                *column = new_name.clone();
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if changed {
+                    refresh_constraint_metadata(&mut other);
+                    catalog.tables.insert(other_name, Arc::new(other));
+                }
+            }
+        }
+        AlterOperation::ModifyColumn {
+            old_name,
+            column,
+            constraints,
+        } => {
+            let index = table
+                .schema
+                .column_index(&old_name)
+                .ok_or_else(|| format!("Column '{old_name}' does not exist"))?;
+            if !old_name.eq_ignore_ascii_case(&column.name) {
+                if table.schema.column_index(&column.name).is_some() {
+                    return Err(format!("Column '{}' already exists", column.name));
+                }
+                rename_schema_references(&mut table.schema, &old_name, &column.name);
+            }
+            for row in &mut table.rows {
+                row.values[index] =
+                    row.values[index]
+                        .coerce_to(&column.data_type)
+                        .ok_or_else(|| {
+                            format!(
+                                "Value in column '{old_name}' cannot be converted to {}",
+                                column.data_type
+                            )
+                        })?;
+            }
+            table.schema.columns[index] = column;
+            for constraint in constraints {
+                let duplicate = table.schema.constraints.iter().any(|existing| {
+                    std::mem::discriminant(existing) == std::mem::discriminant(&constraint)
+                        && constraint_columns(existing) == constraint_columns(&constraint)
+                });
+                if !duplicate {
+                    table.schema.constraints.push(constraint);
+                }
+            }
+        }
+        AlterOperation::SetDefault { column, value } => {
+            let index = table
+                .schema
+                .column_index(&column)
+                .ok_or_else(|| format!("Column '{column}' does not exist"))?;
+            table.schema.columns[index].default = value
+                .map(|value| {
+                    value
+                        .coerce_to(&table.schema.columns[index].data_type)
+                        .ok_or_else(|| {
+                            format!("Default for column '{column}' has an incompatible type")
+                        })
+                })
+                .transpose()?;
+        }
+        AlterOperation::SetNullable { column, nullable } => {
+            let index = table
+                .schema
+                .column_index(&column)
+                .ok_or_else(|| format!("Column '{column}' does not exist"))?;
+            if nullable && table.schema.columns[index].primary_key {
+                return Err("PRIMARY KEY columns cannot be nullable".to_string());
+            }
+            if !nullable && table.rows.iter().any(|row| row.values[index].is_null()) {
+                return Err(format!("Column '{column}' contains NULL values"));
+            }
+            table.schema.columns[index].nullable = nullable;
+        }
+        AlterOperation::SetDataType { column, data_type } => {
+            let index = table
+                .schema
+                .column_index(&column)
+                .ok_or_else(|| format!("Column '{column}' does not exist"))?;
+            for row in &mut table.rows {
+                row.values[index] = row.values[index].coerce_to(&data_type).ok_or_else(|| {
+                    format!("Value in column '{column}' cannot be converted to {data_type}")
+                })?;
+            }
+            if let Some(default) = table.schema.columns[index].default.clone() {
+                table.schema.columns[index].default =
+                    Some(default.coerce_to(&data_type).ok_or_else(|| {
+                        format!("Default in column '{column}' cannot be converted to {data_type}")
+                    })?);
+            }
+            table.schema.columns[index].data_type = data_type;
+        }
+        AlterOperation::AddConstraint(constraint) => {
+            if let Some(name) = constraint_name(&constraint)
+                && table
+                    .schema
+                    .constraints
+                    .iter()
+                    .filter_map(constraint_name)
+                    .any(|existing| existing.eq_ignore_ascii_case(name))
+            {
+                return Err(format!("Constraint '{name}' already exists"));
+            }
+            if matches!(constraint, TableConstraint::PrimaryKey { .. })
+                && table
+                    .schema
+                    .constraints
+                    .iter()
+                    .any(|value| matches!(value, TableConstraint::PrimaryKey { .. }))
+            {
+                return Err("A table may have only one PRIMARY KEY".to_string());
+            }
+            for column in constraint_columns(&constraint) {
+                if table.schema.column_index(&column).is_none() {
+                    return Err(format!("Unknown constrained column '{column}'"));
+                }
+            }
+            if let TableConstraint::Check { expr, .. } = &constraint {
+                validate_expr_columns(expr, &table.schema)?;
+            }
+            table.schema.constraints.push(constraint);
+        }
+        AlterOperation::DropConstraint { name, if_exists } => {
+            let position = table.schema.constraints.iter().position(|constraint| {
+                constraint_name(constraint).is_some_and(|value| value.eq_ignore_ascii_case(&name))
+                    || generated_constraint_name(&table.schema.name, constraint)
+                        .eq_ignore_ascii_case(&name)
+            });
+            if let Some(position) = position {
+                table.schema.constraints.remove(position);
+            } else if !if_exists {
+                return Err(format!("Constraint '{name}' does not exist"));
+            }
+        }
+        AlterOperation::DropPrimaryKey => {
+            let position = table
+                .schema
+                .constraints
+                .iter()
+                .position(|constraint| matches!(constraint, TableConstraint::PrimaryKey { .. }))
+                .ok_or_else(|| "PRIMARY KEY does not exist".to_string())?;
+            table.schema.constraints.remove(position);
+        }
+    }
+    refresh_constraint_metadata(table);
+    Ok(())
+}
+
+fn constraint_columns(constraint: &TableConstraint) -> Vec<String> {
+    match constraint {
+        TableConstraint::PrimaryKey { columns, .. } | TableConstraint::Unique { columns, .. } => {
+            columns.clone()
+        }
+        TableConstraint::ForeignKey(fk) => fk.columns.clone(),
+        TableConstraint::Check { .. } => Vec::new(),
+    }
+}
+
+fn constraint_name(constraint: &TableConstraint) -> Option<&str> {
+    match constraint {
+        TableConstraint::PrimaryKey { name, .. }
+        | TableConstraint::Unique { name, .. }
+        | TableConstraint::Check { name, .. } => name.as_deref(),
+        TableConstraint::ForeignKey(fk) => fk.name.as_deref(),
+    }
+}
+
+fn generated_constraint_name(table: &str, constraint: &TableConstraint) -> String {
+    match constraint {
+        TableConstraint::PrimaryKey { name, .. } => {
+            name.clone().unwrap_or_else(|| format!("{table}_pk"))
+        }
+        TableConstraint::Unique { name, columns } => name
+            .clone()
+            .unwrap_or_else(|| format!("{table}_{}_uk", columns.join("_"))),
+        TableConstraint::ForeignKey(fk) => fk
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("{table}_{}_fk", fk.columns.join("_"))),
+        TableConstraint::Check { name, .. } => {
+            name.clone().unwrap_or_else(|| format!("{table}_check"))
+        }
+    }
+}
+
+fn refresh_constraint_metadata(table: &mut Table) {
+    for column in &mut table.schema.columns {
+        column.primary_key = false;
+        column.unique = false;
+    }
+    for constraint in &table.schema.constraints {
+        match constraint {
+            TableConstraint::PrimaryKey { columns, .. } => {
+                for name in columns {
+                    if let Some(column) = table
+                        .schema
+                        .columns
+                        .iter_mut()
+                        .find(|column| column.name.eq_ignore_ascii_case(name))
+                    {
+                        column.nullable = false;
+                        column.primary_key = columns.len() == 1;
+                        column.unique = columns.len() == 1;
+                    }
+                }
+            }
+            TableConstraint::Unique { columns, .. } if columns.len() == 1 => {
+                if let Some(column) = table
+                    .schema
+                    .columns
+                    .iter_mut()
+                    .find(|column| column.name.eq_ignore_ascii_case(&columns[0]))
+                {
+                    column.unique = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    let manual: Vec<_> = table
+        .schema
+        .indexes
+        .iter()
+        .filter(|index| !index.automatic)
+        .cloned()
+        .collect();
+    table.schema.indexes = automatic_indexes(&table.schema);
+    table.schema.indexes.extend(manual);
+    table.rebuild_index();
+}
+
+fn rename_schema_references(schema: &mut TableSchema, old: &str, new: &str) {
+    let schema_name = schema.name.clone();
+    for constraint in &mut schema.constraints {
+        match constraint {
+            TableConstraint::PrimaryKey { columns, .. }
+            | TableConstraint::Unique { columns, .. } => rename_names(columns, old, new),
+            TableConstraint::ForeignKey(fk) => {
+                rename_names(&mut fk.columns, old, new);
+                if fk.foreign_table.eq_ignore_ascii_case(&schema_name) {
+                    rename_names(&mut fk.referred_columns, old, new);
+                }
+            }
+            TableConstraint::Check { expr, .. } => rename_expr(expr, old, new),
+        }
+    }
+    for index in &mut schema.indexes {
+        rename_names(&mut index.columns, old, new);
+    }
+}
+
+fn rename_names(names: &mut [String], old: &str, new: &str) {
+    for name in names {
+        if name.eq_ignore_ascii_case(old) {
+            *name = new.to_string();
+        }
+    }
+}
+
+fn rename_expr(expr: &mut Expr, old: &str, new: &str) {
+    match expr {
+        Expr::Column { name, .. } if name.eq_ignore_ascii_case(old) => *name = new.to_string(),
+        Expr::Binary { left, right, .. } => {
+            rename_expr(left, old, new);
+            rename_expr(right, old, new);
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => rename_expr(expr, old, new),
+        Expr::Like { expr, pattern, .. } => {
+            rename_expr(expr, old, new);
+            rename_expr(pattern, old, new);
+        }
+        Expr::InList { expr, list, .. } => {
+            rename_expr(expr, old, new);
+            for item in list {
+                rename_expr(item, old, new);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn validate_expr_columns(expr: &Expr, schema: &TableSchema) -> Result<(), String> {
+    match expr {
+        Expr::Column { name, .. } => {
+            if schema.column_index(name).is_none() {
+                return Err(format!("Unknown column '{name}'"));
+            }
+        }
+        Expr::Binary { left, right, .. } => {
+            validate_expr_columns(left, schema)?;
+            validate_expr_columns(right, schema)?;
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } => {
+            validate_expr_columns(expr, schema)?
+        }
+        Expr::Like { expr, pattern, .. } => {
+            validate_expr_columns(expr, schema)?;
+            validate_expr_columns(pattern, schema)?;
+        }
+        Expr::InList { expr, list, .. } => {
+            validate_expr_columns(expr, schema)?;
+            for item in list {
+                validate_expr_columns(item, schema)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn execute_insert(
     catalog: &mut Catalog,
     table_name: &str,
     columns: Option<Vec<String>>,
-    values: Vec<Vec<Expr>>,
+    source: InsertSource,
+    on_duplicate: Vec<(String, Expr)>,
 ) -> ExecutionResult {
     let name = table_name.to_ascii_lowercase();
+    let values = match source {
+        InsertSource::Values(values) => values,
+        InsertSource::Query(query) => match execute_query(catalog, &query, &HashMap::new()) {
+            Ok(relation) => relation
+                .rows
+                .into_iter()
+                .map(|row| row.into_iter().map(Expr::Literal).collect())
+                .collect(),
+            Err(error) => return ExecutionResult::Error(error),
+        },
+    };
     let Some(existing) = catalog.tables.get(&name) else {
         return ExecutionResult::Error(format!("Table '{name}' does not exist"));
     };
@@ -1038,14 +1605,106 @@ fn execute_insert(
         }
         rows.push(Row::new(ordered));
     }
-    let count = match table.insert_rows(rows) {
-        Ok(count) => count,
-        Err(error) => return ExecutionResult::Error(error),
-    };
+    let mut count = 0;
+    for row in rows {
+        let conflicts = table.unique_conflict_positions(&row);
+        if conflicts.is_empty() {
+            if let Err(error) = table.insert_row_indexed(row) {
+                return ExecutionResult::Error(error);
+            }
+            count += 1;
+        } else if on_duplicate.is_empty() {
+            return ExecutionResult::Error("Duplicate entry for PRIMARY or UNIQUE key".to_string());
+        } else if conflicts.len() != 1 {
+            return ExecutionResult::Error(
+                "ON DUPLICATE KEY matched multiple destination rows".to_string(),
+            );
+        } else {
+            let position = *conflicts.iter().next().unwrap();
+            let current = table.rows[position].values.clone();
+            let columns: Vec<_> = table
+                .schema
+                .columns
+                .iter()
+                .map(|column| BoundColumn {
+                    table: name.clone(),
+                    name: column.name.clone(),
+                })
+                .collect();
+            let mut updated = current.clone();
+            for (column, expression) in &on_duplicate {
+                let Some(index) = table.schema.column_index(column) else {
+                    return ExecutionResult::Error(format!("Unknown column '{column}'"));
+                };
+                let bound = bind_incoming(expression.clone(), &table.schema, &row);
+                match eval_expr(&bound, &columns, &updated, None, catalog, &HashMap::new()) {
+                    Ok(value) => {
+                        updated[index] = value
+                            .coerce_to(&table.schema.columns[index].data_type)
+                            .unwrap_or(value)
+                    }
+                    Err(error) => return ExecutionResult::Error(error),
+                }
+            }
+            if updated != current {
+                if let Err(error) = table.replace_row_indexed(position, Row::new(updated)) {
+                    return ExecutionResult::Error(error);
+                }
+                count += 2;
+            }
+        }
+    }
     catalog.tables.insert(name, Arc::new(table));
     match validate_catalog(catalog) {
         Ok(()) => ExecutionResult::RowsAffected(count),
         Err(error) => ExecutionResult::Error(error),
+    }
+}
+
+fn bind_incoming(expression: Expr, schema: &TableSchema, incoming: &Row) -> Expr {
+    match expression {
+        Expr::Incoming(column) => Expr::Literal(
+            schema
+                .column_index(&column)
+                .and_then(|index| incoming.values.get(index))
+                .cloned()
+                .unwrap_or(Value::Null),
+        ),
+        Expr::Binary { left, op, right } => Expr::Binary {
+            left: Box::new(bind_incoming(*left, schema, incoming)),
+            op,
+            right: Box::new(bind_incoming(*right, schema, incoming)),
+        },
+        Expr::Unary { op, expr } => Expr::Unary {
+            op,
+            expr: Box::new(bind_incoming(*expr, schema, incoming)),
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: Box::new(bind_incoming(*expr, schema, incoming)),
+            negated,
+        },
+        Expr::Like {
+            expr,
+            pattern,
+            negated,
+        } => Expr::Like {
+            expr: Box::new(bind_incoming(*expr, schema, incoming)),
+            pattern: Box::new(bind_incoming(*pattern, schema, incoming)),
+            negated,
+        },
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(bind_incoming(*expr, schema, incoming)),
+            list: list
+                .into_iter()
+                .map(|expr| bind_incoming(expr, schema, incoming))
+                .collect(),
+            negated,
+        },
+        other => other,
     }
 }
 
@@ -1316,7 +1975,7 @@ fn expression_resolves(expression: &Expr, columns: &[BoundColumn]) -> bool {
         Expr::Column { qualifier, name } => {
             resolve_column(columns, qualifier.as_deref(), name).is_ok()
         }
-        Expr::Literal(_) => true,
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Incoming(_) => true,
         Expr::Binary { left, right, .. } => {
             expression_resolves(left, columns) && expression_resolves(right, columns)
         }
@@ -1745,6 +2404,10 @@ fn eval_expr(
 ) -> Result<Value, String> {
     match expression {
         Expr::Literal(value) => Ok(value.clone()),
+        Expr::Parameter(index) => Err(format!("Unbound prepared-statement parameter {index}")),
+        Expr::Incoming(column) => Err(format!(
+            "Incoming value '{column}' is only valid in ON DUPLICATE KEY UPDATE"
+        )),
         Expr::Column { qualifier, name } => {
             let index = resolve_column(columns, qualifier.as_deref(), name)?;
             row.get(index)
