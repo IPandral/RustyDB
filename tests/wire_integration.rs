@@ -651,9 +651,13 @@ async fn do_handshake_with_token(
     scramble
 }
 
+async fn do_handshake_without_auth(stream: &mut TcpStream, username: &str) {
+    do_handshake_with_token(stream, username, |_| Vec::new()).await;
+}
+
 async fn connect_without_auth(port: u16) -> TcpStream {
     let mut stream = connect_with_retry(port).await;
-    do_handshake_with_token(&mut stream, "test", |_| Vec::new()).await;
+    do_handshake_without_auth(&mut stream, "test").await;
     stream
 }
 
@@ -771,7 +775,7 @@ async fn test_tcp_handshake_select1_ping_quit() {
         .expect("connect to wire server");
 
     // Handshake (no auth)
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     // SELECT 1
     let rows = send_query(&mut stream, "SELECT 1").await;
@@ -858,7 +862,7 @@ async fn test_tcp_create_insert_select() {
         .await
         .expect("connect");
 
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     // CREATE TABLE
     let rows = send_query(
@@ -929,7 +933,7 @@ async fn test_tcp_system_queries() {
         .await
         .expect("connect");
 
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     // SET command should return OK (no rows)
     let rows = send_query(&mut stream, "SET NAMES utf8mb4").await;
@@ -978,7 +982,7 @@ async fn test_tcp_init_db_and_field_list() {
         .await
         .expect("connect");
 
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     // COM_INIT_DB
     let mut payload = vec![COM_INIT_DB];
@@ -1012,7 +1016,7 @@ async fn test_tcp_unsupported_command() {
         .await
         .expect("connect");
 
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     // Send an unsupported command byte (0xFF is not a valid MySQL command)
     write_packet(&mut stream, 0, &[0xFF]).await;
@@ -1034,7 +1038,7 @@ async fn test_tcp_binary_prepared_statement() {
         let _ = rustydb::start_wire_server(wire_state, port).await;
     });
     let mut stream = connect_with_retry(port).await;
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     let mut prepare = vec![COM_STMT_PREPARE];
     prepare.extend_from_slice(b"SELECT ? AS answer");
@@ -1089,7 +1093,7 @@ async fn test_tcp_prepared_empty_result_uses_declared_metadata() {
         let _ = rustydb::start_wire_server(wire_state, port).await;
     });
     let mut stream = connect_with_retry(port).await;
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
     send_query(
         &mut stream,
         "CREATE TABLE prepared_types (id INT PRIMARY KEY)",
@@ -1146,7 +1150,7 @@ async fn test_tcp_malformed_prepared_commands_keep_connection_alive() {
         let _ = rustydb::start_wire_server(wire_state, port).await;
     });
     let mut stream = connect_with_retry(port).await;
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     let mut prepare = vec![COM_STMT_PREPARE];
     prepare.extend_from_slice(b"SELECT 1");
@@ -1194,7 +1198,7 @@ async fn test_tcp_multiple_queries_same_connection() {
         .await
         .expect("connect");
 
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     // Execute many queries in sequence on the same connection
     for i in 1..=10 {
@@ -1224,8 +1228,8 @@ async fn test_tcp_transaction_statements() {
         .await
         .expect("connect observer");
 
-    do_handshake(&mut stream, "test", "").await;
-    do_handshake(&mut observer, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
+    do_handshake_without_auth(&mut observer, "test").await;
 
     send_query(
         &mut stream,
@@ -1296,8 +1300,8 @@ async fn test_tcp_transaction_serialization_conflict() {
     let mut second = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .expect("connect second");
-    do_handshake(&mut first, "test", "").await;
-    do_handshake(&mut second, "test", "").await;
+    do_handshake_without_auth(&mut first, "test").await;
+    do_handshake_without_auth(&mut second, "test").await;
 
     send_query(
         &mut first,
@@ -1521,7 +1525,7 @@ async fn test_tcp_concurrent_connections() {
                 .await
                 .expect("connect");
 
-            do_handshake(&mut stream, &format!("user{}", i), "").await;
+            do_handshake_without_auth(&mut stream, &format!("user{}", i)).await;
 
             let rows = send_query(&mut stream, "SELECT 1").await;
             assert_eq!(rows.len(), 1);
@@ -1552,7 +1556,7 @@ async fn test_tcp_select_database_and_user() {
         .await
         .expect("connect");
 
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     // SELECT DATABASE()
     let rows = send_query(&mut stream, "SELECT DATABASE()").await;
@@ -1586,7 +1590,7 @@ async fn test_tcp_show_warnings() {
         .await
         .expect("connect");
 
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     // SHOW WARNINGS should return an empty result set (3 columns, 0 rows)
     let rows = send_query(&mut stream, "SHOW WARNINGS").await;
