@@ -783,11 +783,8 @@ pub(crate) fn is_transaction_control(statement: &Statement) -> bool {
 }
 
 fn execute_statement(catalog: &mut Catalog, statement: Statement) -> ExecutionResult {
-    catalog
-        .subquery_cache
-        .lock()
-        .expect("subquery cache lock poisoned")
-        .clear();
+    // Catalog snapshots share tables, but cached subquery results belong to one statement.
+    catalog.subquery_cache = Arc::default();
     match statement {
         Statement::CreateTable {
             table_name,
@@ -2548,7 +2545,7 @@ fn execute_subquery_cached(
     query: &Query,
     ctes: &HashMap<String, Relation>,
 ) -> Result<CachedSubquery, String> {
-    // The cache is cleared at every statement boundary. Pointer identity is
+    // The cache is replaced at every statement boundary. Pointer identity is
     // therefore a cheap and safe key for one immutable AST and CTE environment.
     let key = format!(
         "{}:{:p}:{:p}",

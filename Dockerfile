@@ -4,7 +4,7 @@
 # ============================================================================
 # Stage 1: Build
 # ============================================================================
-FROM rust:latest AS builder
+FROM rust:bookworm AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -14,28 +14,11 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy dependency files first for better caching
 COPY Cargo.toml Cargo.lock ./
-
-# Create a dummy src and benches to build dependencies
-RUN mkdir src && \
-    echo "fn main() {}" > src/main.rs && \
-    echo "pub fn lib() {}" > src/lib.rs && \
-    mkdir -p benches && \
-    echo "fn main() {}" > benches/kv_bench.rs && \
-    echo "fn main() {}" > benches/stress_test_bench.rs && \
-    echo "fn main() {}" > benches/sql_bench.rs
-
-# Build dependencies (this layer is cached)
-RUN cargo build --release --features server 2>/dev/null || true && \
-    rm -rf src benches target/release/rustydb target/release/deps/*rustydb*
-
-# Copy actual source code and benches (benches are referenced in Cargo.toml)
 COPY src ./src
 COPY benches ./benches
 
-# Build the actual binary
-RUN cargo build --release --features server
+RUN cargo build --locked --release --features server
 
 # ============================================================================
 # Stage 2: Runtime

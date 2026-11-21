@@ -432,6 +432,7 @@ RustyDB implements the MySQL client/server protocol v10, allowing standard MySQL
 - **System queries**: `SET`, `USE`, `SELECT @@variables`, `SHOW DATABASES`, transaction control
 - **Result encoding**: text rows plus prepared-statement binary rows and prepare-time metadata
 - **Transactions**: each wire connection owns an isolated SQL session
+- **Session autocommit**: enabled on new connections. Use `SET @@session.autocommit = OFF` (or `0`) to start a transaction on the next SQL statement that accesses the database. `COMMIT` publishes changes, and `ROLLBACK` or disconnect discards pending changes. Switching back to `ON` (or `1`) commits pending changes. RustyDB keeps DDL transactional in this mode.
 - **Reports as**: `5.7.99-RustyDB-0.3.0-beta`
 
 ### Persistence Architecture

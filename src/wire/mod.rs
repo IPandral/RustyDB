@@ -1,5 +1,7 @@
 pub mod protocol;
 
+use sqlparser::dialect::MySqlDialect;
+use sqlparser::tokenizer::{Token, Tokenizer};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -7,7 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::server::AppState;
-use crate::sql::{DataType, ExecutionResult, PreparedStatement, ResultSet, Row, Value};
+use crate::sql::{DataType, ExecutionResult, PreparedStatement, ResultSet, Row, SQLSession, Value};
 use protocol::*;
 
 static NEXT_CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
@@ -61,9 +63,88 @@ async fn write_packets(
     Ok(seq)
 }
 
-fn try_handle_system_query(query: &str) -> Option<ExecutionResult> {
+fn try_set_autocommit(query: &str, session: &SQLSession) -> Option<ExecutionResult> {
+    let tokens = match Tokenizer::new(&MySqlDialect {}, query).tokenize() {
+        Ok(tokens) => tokens,
+        Err(error) => return Some(ExecutionResult::Error(error.to_string())),
+    };
+    let tokens: Vec<_> = tokens
+        .into_iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .collect();
+    let [Token::Word(command), assignments @ ..] = tokens.as_slice() else {
+        return None;
+    };
+    if !command.value.eq_ignore_ascii_case("SET") || command.quote_style.is_some() {
+        return None;
+    }
+
+    let (global, value) =
+        assignments
+            .split(|token| *token == Token::Comma)
+            .find_map(|assignment| {
+                let operator = assignment.iter().position(|token| *token == Token::Eq);
+                let (target, value) = assignment.split_at(operator.unwrap_or(assignment.len()));
+                let target = target
+                    .iter()
+                    .map(|token| match token {
+                        Token::Word(word) => word.value.clone(),
+                        _ => token.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let global = match target.to_ascii_lowercase().as_str() {
+                    "autocommit"
+                    | "session autocommit"
+                    | "local autocommit"
+                    | "@@autocommit"
+                    | "@@session . autocommit"
+                    | "@@local . autocommit" => false,
+                    "global autocommit"
+                    | "persist autocommit"
+                    | "persist_only autocommit"
+                    | "@@global . autocommit" => true,
+                    _ => return None,
+                };
+                Some((global, value))
+            })?;
+    if global {
+        return Some(ExecutionResult::Error(
+            "Only session autocommit can be changed".to_string(),
+        ));
+    }
+    let [Token::Eq, value] = value else {
+        return Some(ExecutionResult::Error(
+            "SET autocommit requires one assignment".to_string(),
+        ));
+    };
+    if assignments.contains(&Token::Comma) {
+        return Some(ExecutionResult::Error(
+            "Multiple SET assignments involving autocommit are unsupported".to_string(),
+        ));
+    }
+    let enabled = match value.to_string().to_ascii_lowercase().as_str() {
+        "1" | "on" => true,
+        "0" | "off" => false,
+        _ => {
+            return Some(ExecutionResult::Error(
+                "SET autocommit requires ON, OFF, 1, or 0".to_string(),
+            ));
+        }
+    };
+    Some(session.set_autocommit(enabled))
+}
+
+fn try_handle_system_query(query: &str, session: &SQLSession) -> Option<ExecutionResult> {
     let trimmed = query.trim().trim_end_matches(';').trim();
     let upper = trimmed.to_uppercase();
+
+    if upper.starts_with("SET")
+        && upper.contains("AUTOCOMMIT")
+        && let Some(result) = try_set_autocommit(trimmed, session)
+    {
+        return Some(result);
+    }
 
     // SET commands
     if upper.starts_with("SET ") && !trimmed[4..].trim_start().starts_with('@') {
@@ -82,7 +163,7 @@ fn try_handle_system_query(query: &str) -> Option<ExecutionResult> {
 
     // Queries containing system variables (@@...)
     if upper.starts_with("SELECT") && upper.contains("@@") {
-        return Some(handle_sysvar_query(trimmed));
+        return Some(handle_sysvar_query(trimmed, session.autocommit()));
     }
 
     // SELECT DATABASE()
@@ -138,7 +219,7 @@ fn try_handle_system_query(query: &str) -> Option<ExecutionResult> {
 }
 
 /// Handle SELECT queries containing @@system_variables.
-fn handle_sysvar_query(query: &str) -> ExecutionResult {
+fn handle_sysvar_query(query: &str, autocommit: bool) -> ExecutionResult {
     let known_vars: &[(&str, &str)] = &[
         ("@@version_comment", "RustyDB SQL Engine"),
         ("@@version", SERVER_VERSION),
@@ -157,12 +238,10 @@ fn handle_sysvar_query(query: &str) -> ExecutionResult {
         ("@@sql_mode", "TRADITIONAL"),
         ("@@time_zone", "SYSTEM"),
         ("@@system_time_zone", "UTC"),
-        ("@@autocommit", "1"),
         ("@@tx_isolation", "REPEATABLE-READ"),
         ("@@transaction_isolation", "REPEATABLE-READ"),
         ("@@lower_case_table_names", "1"),
         ("@@license", "Apache-2.0"),
-        ("@@session.autocommit", "1"),
         ("@@session.transaction_read_only", "0"),
         ("@@session.auto_increment_increment", "1"),
         ("@@session.transaction_isolation", "REPEATABLE-READ"),
@@ -174,32 +253,27 @@ fn handle_sysvar_query(query: &str) -> ExecutionResult {
 
     let mut columns = Vec::new();
     let mut values = Vec::new();
-    let chars: Vec<char> = query.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len().saturating_sub(1) {
-        if chars[i] == '@' && chars[i + 1] == '@' {
-            let start = i;
-            i += 2;
-            while i < chars.len()
-                && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.')
-            {
-                i += 1;
+    for (start, _) in query.match_indices("@@") {
+        let name = &query[start + 2..];
+        let end = name
+            .find(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '.'))
+            .unwrap_or(name.len());
+        let var_name = &query[start..start + 2 + end];
+        let var_lower = var_name.to_ascii_lowercase();
+        let value = match var_lower.as_str() {
+            "@@autocommit" | "@@session.autocommit" | "@@local.autocommit" => {
+                Value::Integer(i64::from(autocommit))
             }
-            let var_name = &query[start..i];
-            let var_lower = var_name.to_lowercase();
-
-            let value = known_vars
-                .iter()
-                .find(|(k, _)| k.to_lowercase() == var_lower)
-                .map(|(_, v)| v.to_string())
-                .unwrap_or_default();
-
-            columns.push(var_name.to_string());
-            values.push(Value::Text(value));
-        } else {
-            i += 1;
-        }
+            "@@global.autocommit" => Value::Integer(1),
+            _ => Value::Text(
+                known_vars
+                    .iter()
+                    .find(|(name, _)| *name == var_lower)
+                    .map_or_else(String::new, |(_, value)| value.to_string()),
+            ),
+        };
+        columns.push(var_name.to_string());
+        values.push(value);
     }
 
     if columns.is_empty() {
@@ -210,6 +284,17 @@ fn handle_sysvar_query(query: &str) -> ExecutionResult {
     let mut rs = ResultSet::new(columns);
     rs.add_row(Row::new(values));
     ExecutionResult::Select(rs)
+}
+
+fn session_status(session: &SQLSession) -> u16 {
+    let mut status = 0;
+    if session.autocommit() {
+        status |= SERVER_STATUS_AUTOCOMMIT;
+    }
+    if session.is_in_transaction() {
+        status |= SERVER_STATUS_IN_TRANS;
+    }
+    status
 }
 
 fn encode_result(result: &ExecutionResult, status: u16) -> Vec<Vec<u8>> {
@@ -573,7 +658,7 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
             }
 
             COM_PING => {
-                let ok = build_ok_packet(0, 0);
+                let ok = build_ok_packet_with_status(0, 0, session_status(&session));
                 if write_packet(&mut stream, 1, &ok).await.is_err() {
                     break;
                 }
@@ -581,7 +666,7 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
 
             COM_INIT_DB => {
                 // Accept any database name
-                let ok = build_ok_packet(0, 0);
+                let ok = build_ok_packet_with_status(0, 0, session_status(&session));
                 if write_packet(&mut stream, 1, &ok).await.is_err() {
                     break;
                 }
@@ -589,7 +674,7 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
 
             COM_FIELD_LIST => {
                 // Deprecated command - return EOF
-                let eof = build_eof_packet();
+                let eof = build_eof_packet_with_status(session_status(&session));
                 if write_packet(&mut stream, 1, &eof).await.is_err() {
                     break;
                 }
@@ -599,18 +684,13 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
                 let query = String::from_utf8_lossy(&data[1..]).to_string();
 
                 // Try system query handler first, then fall through to SQL engine
-                let result = if let Some(sys_result) = try_handle_system_query(&query) {
+                let result = if let Some(sys_result) = try_handle_system_query(&query, &session) {
                     sys_result
                 } else {
                     session.execute(&query)
                 };
 
-                let status = if session.is_in_transaction() {
-                    SERVER_STATUS_AUTOCOMMIT | SERVER_STATUS_IN_TRANS
-                } else {
-                    SERVER_STATUS_AUTOCOMMIT
-                };
-                let packets = encode_result(&result, status);
+                let packets = encode_result(&result, session_status(&session));
                 if write_packets(&mut stream, 1, &packets).await.is_err() {
                     break;
                 }
@@ -624,6 +704,7 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
                         next_statement_id = next_statement_id.wrapping_add(1).max(1);
                         let count = prepared.parameter_count();
                         let result_metadata = session.prepared_result_metadata(&prepared, None);
+                        let status = session_status(&session);
                         let mut packets = vec![build_stmt_prepare_ok(
                             statement_id,
                             result_metadata.len() as u16,
@@ -638,7 +719,7 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
                             ));
                         }
                         if count > 0 {
-                            packets.push(build_eof_packet_with_status(SERVER_STATUS_AUTOCOMMIT));
+                            packets.push(build_eof_packet_with_status(status));
                         }
                         for (name, data_type) in &result_metadata {
                             packets.push(build_column_def(
@@ -649,7 +730,7 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
                             ));
                         }
                         if !result_metadata.is_empty() {
-                            packets.push(build_eof_packet_with_status(SERVER_STATUS_AUTOCOMMIT));
+                            packets.push(build_eof_packet_with_status(status));
                         }
                         prepared_statements.insert(
                             statement_id,
@@ -703,12 +784,8 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
                 let result_metadata =
                     session.prepared_result_metadata(&statement.prepared, Some(&parameters));
                 let result = session.execute_prepared(&statement.prepared, &parameters);
-                let status = if session.is_in_transaction() {
-                    SERVER_STATUS_AUTOCOMMIT | SERVER_STATUS_IN_TRANS
-                } else {
-                    SERVER_STATUS_AUTOCOMMIT
-                };
-                let packets = encode_prepared_result(&result, &result_metadata, status);
+                let packets =
+                    encode_prepared_result(&result, &result_metadata, session_status(&session));
                 if write_packets(&mut stream, 1, &packets).await.is_err() {
                     break;
                 }
@@ -743,7 +820,7 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
                 let statement_id = u32::from_le_bytes(data[1..5].try_into().unwrap());
                 let packet = if let Some(statement) = prepared_statements.get_mut(&statement_id) {
                     statement.long_data.clear();
-                    build_ok_packet(0, 0)
+                    build_ok_packet_with_status(0, 0, session_status(&session))
                 } else {
                     build_err_packet(1243, "HY000", "Unknown prepared statement handler")
                 };

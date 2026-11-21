@@ -304,7 +304,10 @@ impl SQLDatabase {
     pub fn session(&self) -> SQLSession {
         SQLSession {
             database: self.clone(),
-            transaction: Mutex::new(None),
+            state: Mutex::new(SessionState {
+                autocommit: true,
+                transaction: None,
+            }),
             variables: Mutex::new(HashMap::new()),
             prepared: Mutex::new(HashMap::new()),
         }
@@ -677,6 +680,11 @@ struct TransactionState {
     schema_changed: bool,
 }
 
+struct SessionState {
+    autocommit: bool,
+    transaction: Option<TransactionState>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionTransactionState {
     Autocommit,
@@ -686,7 +694,7 @@ pub enum SessionTransactionState {
 /// Connection-local SQL state with optimistic serializable transactions.
 pub struct SQLSession {
     database: SQLDatabase,
-    transaction: Mutex<Option<TransactionState>>,
+    state: Mutex<SessionState>,
     variables: Mutex<HashMap<String, Value>>,
     prepared: Mutex<HashMap<String, PreparedStatement>>,
 }
@@ -847,20 +855,7 @@ impl SQLSession {
             _ => {}
         }
 
-        let mut transaction = self.transaction.lock().expect("transaction lock poisoned");
-        if let Some(state) = transaction.as_mut() {
-            let result = Executor::execute_catalog(&mut state.catalog, statement.clone());
-            if !matches!(result, ExecutionResult::Error(_)) && is_write_statement(&statement) {
-                state
-                    .statements
-                    .push(DurableStatement::Sql(sql.trim().to_string()));
-                state.schema_changed |= is_schema_statement(&statement);
-            }
-            result
-        } else {
-            drop(transaction);
-            self.database.execute_autocommit(sql, statement)
-        }
+        self.execute_statement(statement, DurableStatement::Sql(sql.trim().to_string()))
     }
 
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement, String> {
@@ -894,22 +889,32 @@ impl SQLSession {
             Ok(statement) => Optimizer::optimize_statement(statement),
             Err(error) => return ExecutionResult::Error(error),
         };
-        let mut transaction = self.transaction.lock().expect("transaction lock poisoned");
-        if let Some(state) = transaction.as_mut() {
-            let result = Executor::execute_catalog(&mut state.catalog, statement.clone());
-            if !matches!(result, ExecutionResult::Error(_)) && is_write_statement(&statement) {
-                state
-                    .statements
-                    .push(DurableStatement::Bound(Box::new(statement.clone())));
-                state.schema_changed |= is_schema_statement(&statement);
+        let durable = DurableStatement::Bound(Box::new(statement.clone()));
+        self.execute_statement(statement, durable)
+    }
+
+    fn execute_statement(
+        &self,
+        statement: Statement,
+        durable: DurableStatement,
+    ) -> ExecutionResult {
+        let mut session = self.state.lock().expect("session state lock poisoned");
+        if !session.autocommit {
+            session
+                .transaction
+                .get_or_insert_with(|| self.new_transaction());
+        }
+        if let Some(state) = session.transaction.as_mut() {
+            let is_write = is_write_statement(&statement);
+            let schema_changed = is_schema_statement(&statement);
+            let result = Executor::execute_catalog(&mut state.catalog, statement);
+            if is_write && !matches!(result, ExecutionResult::Error(_)) {
+                state.statements.push(durable);
+                state.schema_changed |= schema_changed;
             }
             result
         } else {
-            drop(transaction);
-            self.database.execute_autocommit_durable(
-                DurableStatement::Bound(Box::new(statement.clone())),
-                statement,
-            )
+            self.database.execute_autocommit_durable(durable, statement)
         }
     }
 
@@ -925,7 +930,14 @@ impl SQLSession {
         let Statement::Query(query) = &bound_statement else {
             return Vec::new();
         };
-        let catalog = self.database.inner.executor.snapshot();
+        let session = self.state.lock().expect("session state lock poisoned");
+        let snapshot;
+        let catalog = if let Some(state) = &session.transaction {
+            &state.catalog
+        } else {
+            snapshot = self.database.inner.executor.snapshot();
+            &snapshot
+        };
         let source_table = match &query.from {
             Some(TableSource::Table { name, alias }) => catalog
                 .tables
@@ -971,22 +983,51 @@ impl SQLSession {
     }
 
     pub fn begin(&self) -> ExecutionResult {
-        let mut transaction = self.transaction.lock().expect("transaction lock poisoned");
-        if transaction.is_some() {
+        let mut session = self.state.lock().expect("session state lock poisoned");
+        if session.transaction.is_some() {
             return ExecutionResult::Error("A transaction is already active".to_string());
         }
+        session.transaction = Some(self.new_transaction());
+        ExecutionResult::TransactionStarted
+    }
+
+    fn new_transaction(&self) -> TransactionState {
         let catalog = self.database.inner.executor.snapshot();
-        *transaction = Some(TransactionState {
+        TransactionState {
             base_version: catalog.version,
             catalog,
             statements: Vec::new(),
             schema_changed: false,
-        });
-        ExecutionResult::TransactionStarted
+        }
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn autocommit(&self) -> bool {
+        self.state
+            .lock()
+            .expect("session state lock poisoned")
+            .autocommit
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn set_autocommit(&self, enabled: bool) -> ExecutionResult {
+        let mut session = self.state.lock().expect("session state lock poisoned");
+        if enabled && !session.autocommit {
+            let result = self.commit_transaction(&mut session.transaction);
+            if matches!(result, ExecutionResult::Error(_)) {
+                return result;
+            }
+        }
+        session.autocommit = enabled;
+        ExecutionResult::RowsAffected(0)
     }
 
     pub fn commit(&self) -> ExecutionResult {
-        let mut transaction = self.transaction.lock().expect("transaction lock poisoned");
+        let mut session = self.state.lock().expect("session state lock poisoned");
+        self.commit_transaction(&mut session.transaction)
+    }
+
+    fn commit_transaction(&self, transaction: &mut Option<TransactionState>) -> ExecutionResult {
         let Some(mut state) = transaction.take() else {
             // MySQL clients commonly issue COMMIT after autocommit statements.
             // Treat that as a successful no-op for wire-protocol compatibility.
@@ -1035,20 +1076,19 @@ impl SQLSession {
     }
 
     pub fn rollback(&self) -> ExecutionResult {
-        let mut transaction = self.transaction.lock().expect("transaction lock poisoned");
-        if transaction.take().is_none() {
-            // As with COMMIT, ROLLBACK outside an explicit transaction is a
-            // successful no-op in MySQL-compatible clients.
-            return ExecutionResult::TransactionRolledBack;
-        }
+        self.state
+            .lock()
+            .expect("session state lock poisoned")
+            .transaction = None;
         ExecutionResult::TransactionRolledBack
     }
 
     pub fn transaction_state(&self) -> SessionTransactionState {
         if self
-            .transaction
+            .state
             .lock()
-            .expect("transaction lock poisoned")
+            .expect("session state lock poisoned")
+            .transaction
             .is_some()
         {
             SessionTransactionState::Active
