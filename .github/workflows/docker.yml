@@ -57,13 +57,41 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Generate test certificates and credentials
+        run: |
+          tls_dir="$RUNNER_TEMP/rustydb-tls"
+          mkdir "$tls_dir"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=RustyDB Test CA' \
+            -keyout "$RUNNER_TEMP/rustydb-ca.key" -out "$tls_dir/ca.crt"
+          openssl req -newkey rsa:2048 -nodes -subj '/CN=localhost' \
+            -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+            -keyout "$tls_dir/server.key" -out "$RUNNER_TEMP/rustydb-server.csr"
+          openssl x509 -req -in "$RUNNER_TEMP/rustydb-server.csr" -days 1 \
+            -CA "$tls_dir/ca.crt" -CAkey "$RUNNER_TEMP/rustydb-ca.key" \
+            -CAcreateserial -copy_extensions copy -out "$tls_dir/server.crt"
+          sudo chown 1000 "$tls_dir/server.key"
+          password="$(openssl rand -hex 32)"
+          printf '::add-mask::%s\n' "$password"
+          {
+            printf 'RUSTYDB_USERNAME=testuser\n'
+            printf 'RUSTYDB_PASSWORD=%s\n' "$password"
+            printf 'RUSTYDB_TLS_CA=%s\n' "$tls_dir/ca.crt"
+            printf 'CURL_CA_BUNDLE=%s\n' "$tls_dir/ca.crt"
+          } >> "$GITHUB_ENV"
+
       - name: Start container
         run: |
           docker run -d \
             --name rustydb-test \
-            -p 8080:8080 \
-            -e RUSTYDB_USERNAME=testuser \
-            -e RUSTYDB_PASSWORD=testpass123 \
+            -p 127.0.0.1:8080:8080 \
+            -p 127.0.0.1:3307:3307 \
+            --mount "type=bind,src=$RUNNER_TEMP/rustydb-tls,dst=/tls,readonly" \
+            -e RUSTYDB_USERNAME \
+            -e RUSTYDB_PASSWORD \
+            -e RUSTYDB_TLS_CERT=/tls/server.crt \
+            -e RUSTYDB_TLS_KEY=/tls/server.key \
+            -e RUSTYDB_TLS_CA=/tls/ca.crt \
+            -e RUSTYDB_UPDATE_CHECK=0 \
             -e RUSTYDB_MEMORY_ONLY=true \
             ${{ env.IMAGE_NAME }}:test
           
@@ -83,19 +111,19 @@ jobs:
       - name: Test health endpoint
         run: |
           echo "Testing health endpoint..."
-          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health)
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" https://localhost:8080/health)
           if [ "$RESPONSE" != "200" ]; then
             echo "Health check failed with status: $RESPONSE"
             docker logs rustydb-test
             exit 1
           fi
           echo "Health check passed!"
-          curl -s http://localhost:8080/health | jq .
+          curl -s https://localhost:8080/health | jq .
 
       - name: Test authentication required
         run: |
           echo "Testing that auth is required..."
-          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/kv/test)
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" https://localhost:8080/kv/test)
           if [ "$RESPONSE" != "401" ]; then
             echo "Expected 401 Unauthorized, got: $RESPONSE"
             exit 1
@@ -104,15 +132,15 @@ jobs:
 
       - name: Test KV operations
         run: |
-          AUTH="testuser:testpass123"
+          AUTH="$RUSTYDB_USERNAME:$RUSTYDB_PASSWORD"
           
           echo "Testing SET operation..."
-          curl -s -u $AUTH -X PUT http://localhost:8080/kv/greeting \
+          curl -s -u "$AUTH" -X PUT https://localhost:8080/kv/greeting \
             -H "Content-Type: application/json" \
             -d '{"value": "Hello, RustyDB!"}' | jq .
           
           echo "Testing GET operation..."
-          RESULT=$(curl -s -u $AUTH http://localhost:8080/kv/greeting)
+          RESULT=$(curl -s -u "$AUTH" https://localhost:8080/kv/greeting)
           echo "$RESULT" | jq .
           
           VALUE=$(echo "$RESULT" | jq -r '.data.value')
@@ -124,24 +152,24 @@ jobs:
 
       - name: Test SQL operations
         run: |
-          AUTH="testuser:testpass123"
+          AUTH="$RUSTYDB_USERNAME:$RUSTYDB_PASSWORD"
           
           echo "Testing CREATE TABLE..."
-          curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+          curl -s -u "$AUTH" -X POST https://localhost:8080/sql/execute \
             -H "Content-Type: application/json" \
             -d '{"query": "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)"}' | jq .
           
           echo "Testing INSERT..."
-          curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+          curl -s -u "$AUTH" -X POST https://localhost:8080/sql/execute \
             -H "Content-Type: application/json" \
             -d '{"query": "INSERT INTO users VALUES (1, '\''Alice'\'', '\''alice@example.com'\'')"}' | jq .
           
-          curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+          curl -s -u "$AUTH" -X POST https://localhost:8080/sql/execute \
             -H "Content-Type: application/json" \
             -d '{"query": "INSERT INTO users VALUES (2, '\''Bob'\'', '\''bob@example.com'\'')"}' | jq .
           
           echo "Testing SELECT..."
-          RESULT=$(curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+          RESULT=$(curl -s -u "$AUTH" -X POST https://localhost:8080/sql/execute \
             -H "Content-Type: application/json" \
             -d '{"query": "SELECT * FROM users"}')
           echo "$RESULT" | jq .
@@ -153,31 +181,31 @@ jobs:
           fi
           
           echo "Testing SELECT with WHERE..."
-          curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+          curl -s -u "$AUTH" -X POST https://localhost:8080/sql/execute \
             -H "Content-Type: application/json" \
             -d '{"query": "SELECT name, email FROM users WHERE id = 1"}' | jq .
           
           echo "Testing UPDATE..."
-          curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+          curl -s -u "$AUTH" -X POST https://localhost:8080/sql/execute \
             -H "Content-Type: application/json" \
             -d '{"query": "UPDATE users SET email = '\''alice.updated@example.com'\'' WHERE id = 1"}' | jq .
           
           echo "Testing DELETE..."
-          curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+          curl -s -u "$AUTH" -X POST https://localhost:8080/sql/execute \
             -H "Content-Type: application/json" \
             -d '{"query": "DELETE FROM users WHERE id = 2"}' | jq .
           
           echo "Testing SHOW TABLES..."
-          curl -s -u $AUTH http://localhost:8080/sql/tables | jq .
+          curl -s -u "$AUTH" https://localhost:8080/sql/tables | jq .
 
           echo "Testing advanced SQL..."
-          curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+          curl -s -u "$AUTH" -X POST https://localhost:8080/sql/execute \
             -H "Content-Type: application/json" \
             -d '{"query": "CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount FLOAT, FOREIGN KEY (user_id) REFERENCES users(id))"}' | jq .
-          curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+          curl -s -u "$AUTH" -X POST https://localhost:8080/sql/execute \
             -H "Content-Type: application/json" \
             -d '{"query": "INSERT INTO orders VALUES (1, 1, 10.5), (2, 1, 20.5)"}' | jq .
-          ADVANCED=$(curl -s -u $AUTH -X POST http://localhost:8080/sql/execute \
+          ADVANCED=$(curl -s -u "$AUTH" -X POST https://localhost:8080/sql/execute \
             -H "Content-Type: application/json" \
             -d '{"query": "WITH totals AS (SELECT user_id, SUM(amount) AS total FROM orders GROUP BY user_id) SELECT users.name, totals.total FROM users INNER JOIN totals ON users.id = totals.user_id"}')
           echo "$ADVANCED" | jq .
@@ -191,15 +219,15 @@ jobs:
 
       - name: Test batch KV operations
         run: |
-          AUTH="testuser:testpass123"
+          AUTH="$RUSTYDB_USERNAME:$RUSTYDB_PASSWORD"
           
           echo "Testing MSET..."
-          curl -s -u $AUTH -X POST http://localhost:8080/kv/mset \
+          curl -s -u "$AUTH" -X POST https://localhost:8080/kv/mset \
             -H "Content-Type: application/json" \
             -d '{"pairs": [{"key": "k1", "value": "v1"}, {"key": "k2", "value": "v2"}, {"key": "k3", "value": "v3"}]}' | jq .
           
           echo "Testing MGET..."
-          RESULT=$(curl -s -u $AUTH -X POST http://localhost:8080/kv/mget \
+          RESULT=$(curl -s -u "$AUTH" -X POST https://localhost:8080/kv/mget \
             -H "Content-Type: application/json" \
             -d '{"keys": ["k1", "k2", "k3"]}')
           echo "$RESULT" | jq .
@@ -213,11 +241,20 @@ jobs:
 
       - name: Test store info
         run: |
-          AUTH="testuser:testpass123"
+          AUTH="$RUSTYDB_USERNAME:$RUSTYDB_PASSWORD"
           
           echo "Getting store info..."
-          curl -s -u $AUTH http://localhost:8080/kv/info | jq .
+          curl -s -u "$AUTH" https://localhost:8080/kv/info | jq .
           echo "Store info retrieved!"
+
+      - name: Test MySQL over verified TLS with Connector/Python
+        run: |
+          python3 -m venv "$RUNNER_TEMP/rustydb-smoke"
+          python="$RUNNER_TEMP/rustydb-smoke/bin/python"
+          requirements="$RUNNER_TEMP/rustydb-smoke-requirements.txt"
+          printf '%s\n' 'mysql-connector-python==26.10.0 --hash=sha256:85643c8a38b7d089ed30b270d842b96a2529354eebea4aa4d8e4755a630487e8' > "$requirements"
+          "$python" -m pip install --only-binary=:all: --no-deps --require-hashes -r "$requirements"
+          "$python" tests/test_wire_python.py
 
       - name: View container logs
         if: always()
