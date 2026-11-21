@@ -53,6 +53,7 @@ def parse_args():
     p.add_argument("--rustydb-port", type=int, default=int(os.environ.get("RUSTYDB_WIRE_PORT", "3307")))
     p.add_argument("--rustydb-user", default=os.environ.get("RUSTYDB_USERNAME", "root"))
     p.add_argument("--rustydb-pass", default=os.environ.get("RUSTYDB_PASSWORD", ""))
+    p.add_argument("--rustydb-ssl-ca", default=os.environ.get("RUSTYDB_TLS_CA"))
     p.add_argument("--mysql-host", default="127.0.0.1")
     p.add_argument("--mysql-port", type=int, default=3306)
     p.add_argument("--mysql-user", default="root")
@@ -62,14 +63,19 @@ def parse_args():
     p.add_argument("--warmup", "-w", type=int, default=10)
     p.add_argument("--filter", default=None, help="Regex to filter benchmark names")
     p.add_argument("--csv", default=None, metavar="FILE", help="Write results to CSV")
-    return p.parse_args()
+    args = p.parse_args()
+    if not args.rustydb_ssl_ca and (
+        args.rustydb_pass or args.rustydb_host not in ("127.0.0.1", "::1", "localhost")
+    ):
+        p.error("Authenticated and remote RustyDB connections require --rustydb-ssl-ca")
+    return args
 
 
 # ---------------------------------------------------------------------------
 # Connection helpers
 # ---------------------------------------------------------------------------
 
-def try_connect(host, port, user, password, database=None, timeout=30):
+def try_connect(host, port, user, password, database=None, timeout=30, **tls_options):
     """Attempt connection with retries and exponential backoff."""
     deadline = time.time() + timeout
     delay = 0.5
@@ -82,8 +88,8 @@ def try_connect(host, port, user, password, database=None, timeout=30):
                 user=user,
                 password=password,
                 connection_timeout=5,
-                auth_plugin="mysql_native_password",
                 use_pure=True,
+                **tls_options,
             )
             if database:
                 kwargs["database"] = database
@@ -735,10 +741,19 @@ def main():
     print()
     print(f"Connecting to targets...")
 
+    tls_options = (
+        {
+            "ssl_ca": args.rustydb_ssl_ca,
+            "ssl_verify_cert": True,
+            "ssl_verify_identity": True,
+        }
+        if args.rustydb_ssl_ca else {"ssl_disabled": True}
+    )
     rustydb_conn = try_connect(
         args.rustydb_host, args.rustydb_port,
         args.rustydb_user, args.rustydb_pass,
         timeout=10,
+        **tls_options,
     )
     if rustydb_conn:
         print(f"  RustyDB  {args.rustydb_host}:{args.rustydb_port}  connected")

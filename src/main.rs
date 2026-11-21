@@ -135,6 +135,7 @@ fn run_server_mode(memory_only: bool, data_dir: &str) {
     rt.block_on(async {
         if let Err(e) = start_server(config).await {
             eprintln!("Server error: {}", e);
+            std::process::exit(1);
         }
     });
 }

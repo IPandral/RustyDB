@@ -54,8 +54,12 @@ USER rustydb
 # RUSTYDB_HOST        - Bind address (default: 0.0.0.0)
 # RUSTYDB_PORT        - HTTP API port (default: 8080)
 # RUSTYDB_WIRE_PORT   - MySQL wire protocol port (default: 3307)
-# RUSTYDB_USERNAME    - Auth username (shared by HTTP and wire protocol)
-# RUSTYDB_PASSWORD    - Auth password (shared by HTTP and wire protocol)
+# RUSTYDB_USERNAME    - Required server username
+# RUSTYDB_PASSWORD    - Required server password
+# RUSTYDB_TLS_CERT    - PEM certificate chain for HTTP and MySQL
+# RUSTYDB_TLS_KEY     - PEM private key for HTTP and MySQL
+# RUSTYDB_TLS_CA      - Optional PEM CA bundle used by the container health check
+# RUSTYDB_HEALTH_HOST - Certificate hostname for the health check (default: localhost)
 # RUSTYDB_DATA_DIR    - Data directory (default: /data)
 # RUSTYDB_MEMORY_ONLY - Use in-memory only mode (default: false)
 # RUSTYDB_PLAN_CACHE_CAPACITY - Parsed/optimized plan LRU entries (default: 256)
@@ -77,7 +81,14 @@ EXPOSE 3307
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:${RUSTYDB_PORT}/health || exit 1
+    CMD if [ -n "${RUSTYDB_TLS_CERT:-}" ]; then \
+        host="${RUSTYDB_HEALTH_HOST:-localhost}"; \
+        set --; \
+        if [ -n "${RUSTYDB_TLS_CA:-}" ]; then set -- --cacert "$RUSTYDB_TLS_CA"; fi; \
+        curl --noproxy '*' -fsS "$@" --resolve "$host:${RUSTYDB_PORT}:127.0.0.1" "https://$host:${RUSTYDB_PORT}/health"; \
+    else \
+        curl --noproxy '*' -fsS "http://127.0.0.1:${RUSTYDB_PORT}/health"; \
+    fi
 
 # Volume for persistent data
 VOLUME ["/data"]

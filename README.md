@@ -62,9 +62,9 @@ Connect with any standard MySQL client -- `mysql` CLI, Python (`mysql-connector-
 - **Automatic migration of legacy per-table JSON files**
 
 #### Network Interfaces
-- **MySQL Wire Protocol (TCP)** -- connect with any MySQL client on port 3307
-- **REST API (HTTP)** -- JSON API on port 8080 for KV and SQL operations
-- **Basic Auth** -- optional authentication for both HTTP and wire protocol
+- **MySQL Wire Protocol over TLS** -- connect with MySQL 8-compatible clients on port 3307
+- **REST API over HTTPS** -- JSON API on port 8080 for KV and SQL operations
+- **Authentication** -- HTTP Basic Auth and MySQL `caching_sha2_password`
 - **Docker & Docker Compose** support for deployment
 
 #### CLI Modes
@@ -94,8 +94,9 @@ cargo run --release
 # Run in SQL mode
 cargo run --release -- --sql
 
-# Run as server (HTTP + MySQL wire protocol)
-cargo run --release --features server -- --server
+# Run both listeners in local development mode
+RUSTYDB_HOST=127.0.0.1 RUSTYDB_ALLOW_UNAUTHENTICATED_LOCAL=1 \
+  cargo run --release --features server -- --server
 
 # Run with custom data directory
 cargo run --release -- --data=/path/to/data --sql
@@ -115,27 +116,24 @@ cargo run --release -- wal-prune --data=./rustydb_data --before=2026-07-01T00:00
 
 ### Server Mode
 
-Start the server to expose both the HTTP REST API and MySQL wire protocol:
+For network deployments, configure a PEM certificate chain, its private key, and a nonempty username and password. The same TLS identity serves HTTPS and MySQL. Use a certificate that clients trust and that names the hostname they connect to. Set `RUSTYDB_PASSWORD` through your deployment's secret store before starting the server.
 
 ```bash
-# Start with defaults (HTTP on 8080, MySQL on 3307, no auth)
-cargo run --release --features server -- --server
-
-# Or configure via environment variables
-RUSTYDB_PORT=8080 \
-RUSTYDB_WIRE_PORT=3307 \
 RUSTYDB_USERNAME=admin \
-RUSTYDB_PASSWORD=secret \
+RUSTYDB_TLS_CERT=/path/to/server.crt \
+RUSTYDB_TLS_KEY=/path/to/server.key \
 cargo run --release --features server -- --server
 ```
 
+For local development, set `RUSTYDB_HOST=127.0.0.1` (or `::1`) and `RUSTYDB_ALLOW_UNAUTHENTICATED_LOCAL=1` with the credential and TLS variables unset. This mode serves plain HTTP and MySQL only on the loopback address.
+
 ### Connecting with MySQL Clients
 
-Once the server is running, connect with any standard MySQL client:
+Use a client that supports `caching_sha2_password` and certificate hostname verification. Remove any client setting that forces `mysql_native_password`.
 
 ```bash
-# MySQL CLI
-mysql -h 127.0.0.1 -P 3307 -u admin -p
+mysql -h localhost -P 3307 --protocol=TCP --ssl-mode=VERIFY_IDENTITY \
+  --ssl-ca=/path/to/ca.crt -u admin -p
 
 # Then run SQL as normal:
 # mysql> CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT);
@@ -146,13 +144,18 @@ mysql -h 127.0.0.1 -P 3307 -u admin -p
 **Python** (`mysql-connector-python`):
 
 ```python
+import os
 import mysql.connector
 
 conn = mysql.connector.connect(
-    host='127.0.0.1',
+    host='localhost',
     port=3307,
     user='admin',
-    password='secret'
+    password=os.environ["RUSTYDB_PASSWORD"],
+    ssl_ca="/path/to/ca.crt",
+    ssl_verify_cert=True,
+    ssl_verify_identity=True,
+    use_pure=True,
 )
 cursor = conn.cursor()
 cursor.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT)")
@@ -163,13 +166,13 @@ for row in cursor.fetchall():
 conn.close()
 ```
 
-**Rust** (`mysql` crate):
+**Rust** (`mysql` crate, loopback development mode):
 
 ```rust
 use mysql::*;
 use mysql::prelude::*;
 
-let pool = Pool::new("mysql://admin:secret@127.0.0.1:3307/rustydb")?;
+let pool = Pool::new("mysql://root@127.0.0.1:3307/rustydb")?;
 let mut conn = pool.get_conn()?;
 
 conn.query_drop("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")?;
@@ -181,16 +184,13 @@ let results: Vec<(i64, String)> =
 
 ### Docker
 
-```bash
-# Build and run with Docker Compose
-cp .env.example .env
-# Edit .env to set credentials and ports
-docker-compose up -d
+Set `RUSTYDB_TLS_DIR` to a directory with `server.crt` and `server.key`, readable by the container's UID 1000. Compose mounts it read-only. Set `RUSTYDB_USERNAME` and `RUSTYDB_PASSWORD` before starting. For a private CA, set `RUSTYDB_CONTAINER_TLS_CA=/tls/ca.crt` and include that CA file in the mounted directory. Set `RUSTYDB_HEALTH_HOST` if the server certificate uses a hostname other than `localhost`.
 
-# Or run directly
-docker build -t rustydb .
-docker run -p 8080:8080 -p 3307:3307 rustydb
+```bash
+docker compose up -d --build
 ```
+
+Published ports bind to the host loopback address by default. Set `RUSTYDB_PUBLISH_HOST` to the intended host address for remote clients.
 
 ### Key-Value Mode Usage
 
@@ -357,7 +357,7 @@ When running in server mode, the following endpoints are available:
 |--------|------|-------------|
 | GET | `/health` | Health check (no auth required) |
 
-Authentication uses HTTP Basic Auth when `RUSTYDB_USERNAME` and `RUSTYDB_PASSWORD` are set. The `/health` endpoint is always accessible without authentication.
+HTTPS API requests use HTTP Basic Auth with the configured credentials. The `/health` endpoint is accessible without credentials. Local development mode provides the same API on loopback over HTTP.
 
 ## Architecture
 
@@ -427,13 +427,13 @@ Unsupported in this release: correlated/recursive subqueries, recursive CTEs, wi
 
 RustyDB implements the MySQL client/server protocol v10, allowing standard MySQL clients to connect directly:
 
-- **Handshake**: Server greeting with `mysql_native_password` authentication
+- **Handshake**: TLS with the full `caching_sha2_password` authentication exchange
 - **Commands**: `COM_QUERY`, `COM_PING`, `COM_QUIT`, `COM_INIT_DB`, `COM_FIELD_LIST`, and `COM_STMT_PREPARE/EXECUTE/RESET/CLOSE/SEND_LONG_DATA`
 - **System queries**: `SET`, `USE`, `SELECT @@variables`, `SHOW DATABASES`, transaction control
 - **Result encoding**: text rows plus prepared-statement binary rows and prepare-time metadata
 - **Transactions**: each wire connection owns an isolated SQL session
 - **Session autocommit**: enabled on new connections. Use `SET @@session.autocommit = OFF` (or `0`) to start a transaction on the next SQL statement that accesses the database. `COMMIT` publishes changes, and `ROLLBACK` or disconnect discards pending changes. Switching back to `ON` (or `1`) commits pending changes. RustyDB keeps DDL transactional in this mode.
-- **Reports as**: `5.7.99-RustyDB-0.3.0-beta`
+- **Reports as**: `8.0.99-RustyDB-0.3.0-beta`
 
 ### Persistence Architecture
 
@@ -471,6 +471,9 @@ Backups and restores are deliberately offline. Engine-level advisory locks rejec
 | `RUSTYDB_WIRE_PORT` | `3307` | MySQL wire protocol port |
 | `RUSTYDB_USERNAME` | *(none)* | Auth username (both HTTP and wire) |
 | `RUSTYDB_PASSWORD` | *(none)* | Auth password (both HTTP and wire) |
+| `RUSTYDB_TLS_CERT` | *(none)* | PEM certificate chain required for authenticated server mode |
+| `RUSTYDB_TLS_KEY` | *(none)* | PEM private key required for authenticated server mode |
+| `RUSTYDB_ALLOW_UNAUTHENTICATED_LOCAL` | `false` | Opt into unauthenticated development on a numeric loopback address |
 | `RUSTYDB_DATA_DIR` | `./rustydb_data` | Data directory for persistence |
 | `RUSTYDB_MEMORY_ONLY` | `false` | Memory-only mode (no disk writes) |
 | `RUSTYDB_PLAN_CACHE_CAPACITY` | `256` | Parsed/optimized-plan LRU entries |
@@ -499,9 +502,8 @@ cargo test sql::parser::tests
 cargo test sql::executor::tests
 cargo test sql::database::tests
 
-# Run Python wire protocol tests (requires running server)
-# First: cargo run --release --features server -- --server
-# Then:  python tests/test_wire_python.py --host 127.0.0.1 --port 3307
+# Run Python wire protocol tests against an authenticated server
+python tests/test_wire_python.py --host localhost --ssl-ca /path/to/ca.crt
 
 # Run benchmarks
 cargo bench
@@ -594,8 +596,9 @@ cargo bench --bench kv_bench
 # 1. Start MySQL container
 docker compose -f benches/compare/docker-compose.mysql.yml up -d
 
-# 2. Start RustyDB server (separate terminal)
-cargo run --release --features server -- --server --memory
+# 2. Start RustyDB in loopback development mode (separate terminal)
+RUSTYDB_HOST=127.0.0.1 RUSTYDB_ALLOW_UNAUTHENTICATED_LOCAL=1 \
+  cargo run --release --features server -- --server --memory
 
 # 3. Install Python dependencies and run
 pip install -r benches/compare/requirements.txt

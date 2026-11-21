@@ -3,7 +3,7 @@
 //! Tests cover:
 //! - Protocol packet building (handshake, OK, ERR, EOF, column def, text row)
 //! - Length-encoded integer and string encoding
-//! - Scramble generation and mysql_native_password authentication
+//! - Scramble generation and TLS authentication
 //! - Client handshake response parsing
 //! - Full TCP integration: connect, handshake, query, ping, quit
 
@@ -20,6 +20,9 @@ fn test_config(port: u16) -> ServerConfig {
         port: 0,        // HTTP port - unused in wire tests
         username: None, // no auth
         password: None,
+        tls_cert: None,
+        tls_key: None,
+        allow_unauthenticated_local: true,
         data_dir: String::new(),
         memory_only: true,
         wire_port: port,
@@ -29,21 +32,35 @@ fn test_config(port: u16) -> ServerConfig {
     }
 }
 
-fn test_config_with_auth(port: u16, user: &str, pass: &str) -> ServerConfig {
-    ServerConfig {
-        host: "127.0.0.1".to_string(),
-        port: 0,
-        username: Some(user.to_string()),
-        password: Some(pass.to_string()),
-        data_dir: String::new(),
-        memory_only: true,
-        wire_port: port,
-        plan_cache_capacity: 256,
-        memory_pool_capacity: 32,
-        bloom_false_positive_rate: 0.01,
-    }
-}
+fn test_config_with_tls(port: u16) -> (ServerConfig, TlsConnector, tempfile::TempDir) {
+    let mut config = test_config(port);
+    config.allow_unauthenticated_local = false;
+    config.username = Some("tls-user".to_string());
+    let mut secret = [0; 16];
+    getrandom::fill(&mut secret).unwrap();
+    config.password = Some(format!("{:032x}", u128::from_le_bytes(secret)));
 
+    let files = tempfile::tempdir().unwrap();
+    let rcgen::CertifiedKey { cert, signing_key } =
+        rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert_path = files.path().join("server.pem");
+    let key_path = files.path().join("server-key.pem");
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, signing_key.serialize_pem()).unwrap();
+    config.tls_cert = Some(cert_path);
+    config.tls_key = Some(key_path);
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.der().clone()).unwrap();
+    let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    (config, TlsConnector::from(Arc::new(client)), files)
+}
 fn test_app_state(cfg: ServerConfig) -> Arc<AppState> {
     Arc::new(AppState {
         kv_store: KVStore::new(),
@@ -52,10 +69,11 @@ fn test_app_state(cfg: ServerConfig) -> Arc<AppState> {
     })
 }
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_rustls::{TlsConnector, rustls};
 
-async fn read_packet(stream: &mut TcpStream) -> (u8, Vec<u8>) {
+async fn read_packet(stream: &mut (impl AsyncRead + Unpin)) -> (u8, Vec<u8>) {
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).await.expect("read header");
 
@@ -69,7 +87,7 @@ async fn read_packet(stream: &mut TcpStream) -> (u8, Vec<u8>) {
     (seq_id, payload)
 }
 
-async fn write_packet(stream: &mut TcpStream, seq_id: u8, payload: &[u8]) {
+async fn write_packet(stream: &mut (impl AsyncWrite + Unpin), seq_id: u8, payload: &[u8]) {
     let len = payload.len();
     let header = [
         (len & 0xFF) as u8,
@@ -127,7 +145,7 @@ fn build_client_handshake_response(
     }
 
     // Auth plugin name (null-terminated)
-    pkt.extend_from_slice(b"mysql_native_password");
+    pkt.extend_from_slice(AUTH_PLUGIN.as_bytes());
     pkt.push(0);
 
     pkt
@@ -150,31 +168,9 @@ fn build_lenenc_client_handshake_response(username: &str, auth_response: &[u8]) 
     pkt.push(0);
     pkt.extend_from_slice(&encode_lenenc_int(auth_response.len() as u64));
     pkt.extend_from_slice(auth_response);
-    pkt.extend_from_slice(b"mysql_native_password");
+    pkt.extend_from_slice(AUTH_PLUGIN.as_bytes());
     pkt.push(0);
     pkt
-}
-
-fn compute_auth_token(password: &str, scramble: &[u8]) -> Vec<u8> {
-    use sha1::{Digest, Sha1};
-
-    if password.is_empty() {
-        return Vec::new();
-    }
-
-    let stage1: [u8; 20] = Sha1::digest(password.as_bytes()).into();
-    let stage2: [u8; 20] = Sha1::digest(stage1).into();
-
-    let mut concat = Vec::with_capacity(scramble.len() + 20);
-    concat.extend_from_slice(scramble);
-    concat.extend_from_slice(&stage2);
-    let scramble_hash: [u8; 20] = Sha1::digest(&concat).into();
-
-    let mut token = [0u8; 20];
-    for i in 0..20 {
-        token[i] = stage1[i] ^ scramble_hash[i];
-    }
-    token.to_vec()
 }
 
 fn extract_scramble_from_greeting(payload: &[u8]) -> [u8; 20] {
@@ -314,8 +310,8 @@ fn test_read_null_terminated_at_end() {
 
 #[test]
 fn test_generate_scramble_no_zeros() {
-    for conn_id in 0..100 {
-        let scramble = generate_scramble(conn_id);
+    for _ in 0..100 {
+        let scramble = generate_scramble().unwrap();
         assert_eq!(scramble.len(), 20);
         for b in &scramble {
             assert_ne!(*b, 0, "scramble must not contain zero bytes");
@@ -324,46 +320,17 @@ fn test_generate_scramble_no_zeros() {
 }
 
 #[test]
-fn test_generate_scramble_varies_by_conn_id() {
-    let s1 = generate_scramble(1);
-    let s2 = generate_scramble(2);
+fn test_generate_scramble_varies_between_calls() {
+    let s1 = generate_scramble().unwrap();
+    let s2 = generate_scramble().unwrap();
     // Extremely unlikely to collide; this is a basic sanity check.
     assert_ne!(s1, s2);
 }
 
 #[test]
-fn test_verify_mysql_native_password_correct() {
-    let scramble = generate_scramble(42);
-    let password = "s3cret!";
-    let token = compute_auth_token(password, &scramble);
-    assert!(verify_mysql_native_password(password, &scramble, &token));
-}
-
-#[test]
-fn test_verify_mysql_native_password_wrong_password() {
-    let scramble = generate_scramble(42);
-    let token = compute_auth_token("correct", &scramble);
-    assert!(!verify_mysql_native_password("wrong", &scramble, &token));
-}
-
-#[test]
-fn test_verify_mysql_native_password_empty() {
-    let scramble = generate_scramble(42);
-    // Empty password + empty auth response should succeed
-    assert!(verify_mysql_native_password("", &scramble, &[]));
-}
-
-#[test]
-fn test_verify_mysql_native_password_bad_length() {
-    let scramble = generate_scramble(42);
-    // Auth response with wrong length should fail
-    assert!(!verify_mysql_native_password("pass", &scramble, &[1, 2, 3]));
-}
-
-#[test]
 fn test_build_handshake_v10_structure() {
-    let scramble = generate_scramble(7);
-    let pkt = build_handshake_v10(7, &scramble);
+    let scramble = generate_scramble().unwrap();
+    let pkt = build_handshake_v10(7, &scramble, false);
 
     // Protocol version
     assert_eq!(pkt[0], 10, "protocol version must be 10");
@@ -388,11 +355,11 @@ fn test_build_handshake_v10_structure() {
     assert_eq!(extracted, scramble);
 
     // Auth plugin name at end of packet - should end with
-    // "mysql_native_password\0"
-    let suffix = b"mysql_native_password\x00";
+    // "caching_sha2_password\0"
+    let suffix = b"caching_sha2_password\x00";
     assert!(
         pkt.ends_with(suffix),
-        "handshake must advertise mysql_native_password plugin"
+        "handshake must advertise caching_sha2_password plugin"
     );
 }
 
@@ -567,7 +534,7 @@ fn test_parse_client_handshake_basic() {
     assert_eq!(parsed.username, "testuser");
     assert_eq!(parsed.auth_response, vec![0xAA; 20]);
     assert!(parsed.database.is_none());
-    assert_eq!(parsed.auth_plugin.as_deref(), Some("mysql_native_password"));
+    assert_eq!(parsed.auth_plugin.as_deref(), Some(AUTH_PLUGIN));
 }
 
 #[test]
@@ -596,7 +563,7 @@ fn test_parse_client_handshake_lenenc_auth() {
 
     assert_eq!(parsed.username, "lenenc");
     assert_eq!(parsed.auth_response, auth_response);
-    assert_eq!(parsed.auth_plugin.as_deref(), Some("mysql_native_password"));
+    assert_eq!(parsed.auth_plugin.as_deref(), Some(AUTH_PLUGIN));
 }
 
 #[test]
@@ -616,44 +583,19 @@ fn test_parse_client_handshake_capabilities() {
     assert_ne!(parsed.capabilities & CLIENT_PLUGIN_AUTH, 0);
 }
 
-/// Perform the full MySQL handshake on an already-connected TCP stream.
-/// Returns the scramble used by the server.
-async fn do_handshake(stream: &mut TcpStream, username: &str, password: &str) -> [u8; 20] {
-    do_handshake_with_token(stream, username, |scramble| {
-        compute_auth_token(password, scramble)
-    })
-    .await
-}
-
-async fn do_handshake_with_token(
-    stream: &mut TcpStream,
-    username: &str,
-    build_auth_token: impl FnOnce(&[u8; 20]) -> Vec<u8>,
-) -> [u8; 20] {
-    // 1. Read the server greeting (seq 0)
+async fn do_handshake_without_auth(stream: &mut TcpStream, username: &str) {
     let (seq, greeting) = read_packet(stream).await;
     assert_eq!(seq, 0, "greeting should have sequence id 0");
     assert_eq!(greeting[0], 10, "protocol version must be 10");
-
-    // 2. Extract scramble
-    let scramble = extract_scramble_from_greeting(&greeting);
-
-    // 3. Build and send the client handshake response (seq 1)
-    let auth_token = build_auth_token(&scramble);
-    let response = build_client_handshake_response(username, &auth_token, None);
+    let response = build_client_handshake_response(username, &[], None);
     write_packet(stream, 1, &response).await;
-
-    // 4. Read OK (seq 2)
     let (seq, ok_pkt) = read_packet(stream).await;
     assert_eq!(seq, 2, "OK should have sequence id 2");
     assert_eq!(ok_pkt[0], 0x00, "expected OK packet after handshake");
-
-    scramble
 }
-
 async fn connect_without_auth(port: u16) -> TcpStream {
     let mut stream = connect_with_retry(port).await;
-    do_handshake_with_token(&mut stream, "test", |_| Vec::new()).await;
+    do_handshake_without_auth(&mut stream, "test").await;
     stream
 }
 
@@ -730,14 +672,14 @@ async fn send_query_error(stream: &mut TcpStream, query: &str) -> String {
 }
 
 /// Send COM_PING and assert OK response.
-async fn send_ping(stream: &mut TcpStream) {
+async fn send_ping(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) {
     write_packet(stream, 0, &[COM_PING]).await;
     let (_seq, ok) = read_packet(stream).await;
     assert_eq!(ok[0], 0x00, "COM_PING should return OK");
 }
 
 /// Send COM_QUIT.
-async fn send_quit(stream: &mut TcpStream) {
+async fn send_quit(stream: &mut (impl AsyncWrite + Unpin)) {
     write_packet(stream, 0, &[COM_QUIT]).await;
 }
 
@@ -771,7 +713,7 @@ async fn test_tcp_handshake_select1_ping_quit() {
         .expect("connect to wire server");
 
     // Handshake (no auth)
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     // SELECT 1
     let rows = send_query(&mut stream, "SELECT 1").await;
@@ -789,58 +731,105 @@ async fn test_tcp_handshake_select1_ping_quit() {
     send_quit(&mut stream).await;
 }
 
-#[tokio::test]
-async fn test_tcp_auth_success() {
-    let port = random_port().await;
-    let state = test_app_state(test_config_with_auth(port, "admin", "hunter2"));
-
-    let wire_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        let _ = rustydb::start_wire_server(wire_state, port).await;
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+async fn begin_tls_handshake(
+    port: u16,
+    connector: &TlsConnector,
+    hostname: &'static str,
+    response: &[u8],
+) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let mut stream = connect_with_retry(port).await;
+    let (sequence, greeting) = read_packet(&mut stream).await;
+    assert_eq!(sequence, 0);
+    let capabilities_offset = greeting[1..].iter().position(|&byte| byte == 0).unwrap() + 15;
+    let capabilities = u16::from_le_bytes(
+        greeting[capabilities_offset..capabilities_offset + 2]
+            .try_into()
+            .unwrap(),
+    );
+    assert_ne!(capabilities & CLIENT_SSL as u16, 0);
+    write_packet(&mut stream, 1, &response[..32]).await;
+    connector
+        .connect(
+            rustls::pki_types::ServerName::try_from(hostname).unwrap(),
+            stream,
+        )
         .await
-        .expect("connect");
-
-    // Should succeed with correct credentials
-    do_handshake(&mut stream, "admin", "hunter2").await;
-
-    send_ping(&mut stream).await;
-    send_quit(&mut stream).await;
 }
 
 #[tokio::test]
-async fn test_tcp_auth_failure() {
+async fn test_tcp_tls_authentication() {
     let port = random_port().await;
-    let state = test_app_state(test_config_with_auth(port, "admin", "hunter2"));
+    let (config, connector, _files) = test_config_with_tls(port);
+    let username = config.username.clone().unwrap();
+    let password = config.password.clone().unwrap();
+    let state = test_app_state(config);
+    tokio::spawn(async move { rustydb::start_wire_server(state, port).await.unwrap() });
 
-    let wire_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        let _ = rustydb::start_wire_server(wire_state, port).await;
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut response = build_client_handshake_response(&username, &[], None);
+    let capabilities = u32::from_le_bytes(response[..4].try_into().unwrap()) | CLIENT_SSL;
+    response[..4].copy_from_slice(&capabilities.to_le_bytes());
+    assert!(
+        begin_tls_handshake(port, &connector, "wrong-name.invalid", &response)
+            .await
+            .is_err()
+    );
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .await
-        .expect("connect");
+    let mut plaintext = connect_with_retry(port).await;
+    read_packet(&mut plaintext).await;
+    write_packet(&mut plaintext, 1, &response).await;
+    let (sequence, packet) = read_packet(&mut plaintext).await;
+    assert_eq!(sequence, 2);
+    assert_eq!(packet[0], 0xFF);
+    assert_eq!(u16::from_le_bytes([packet[1], packet[2]]), 3159);
 
-    // Read greeting
-    let (_seq, greeting) = read_packet(&mut stream).await;
-    let scramble = extract_scramble_from_greeting(&greeting);
+    for valid in [false, true] {
+        let mut stream = begin_tls_handshake(port, &connector, "localhost", &response)
+            .await
+            .unwrap();
+        write_packet(&mut stream, 2, &response).await;
+        assert_eq!(read_packet(&mut stream).await, (3, vec![0x01, 0x04]));
+        let mut candidate = password.as_bytes().to_vec();
+        if !valid {
+            candidate[0] ^= 1;
+        }
+        candidate.push(0);
+        write_packet(&mut stream, 4, &candidate).await;
+        let (sequence, packet) = read_packet(&mut stream).await;
+        assert_eq!(sequence, 5);
+        if valid {
+            assert_eq!(packet[0], 0x00);
+            send_ping(&mut stream).await;
+            send_quit(&mut stream).await;
+        } else {
+            assert_eq!(packet, build_err_packet(1045, "28000", "Access denied"));
+        }
+    }
+}
+#[tokio::test]
+async fn test_wire_refuses_unsafe_startup() {
+    let mut config = test_config(0);
+    config.host = "0.0.0.0".into();
+    assert!(
+        rustydb::start_wire_server(test_app_state(config), 0)
+            .await
+            .is_err()
+    );
 
-    // Send wrong password
-    let bad_token = compute_auth_token("wrongpassword", &scramble);
-    let response = build_client_handshake_response("admin", &bad_token, None);
-    write_packet(&mut stream, 1, &response).await;
+    let mut config = test_config(0);
+    config.allow_unauthenticated_local = false;
+    assert!(
+        rustydb::start_wire_server(test_app_state(config), 0)
+            .await
+            .is_err()
+    );
 
-    // Server should respond with ERR packet
-    let (_seq, err_pkt) = read_packet(&mut stream).await;
-    assert_eq!(err_pkt[0], 0xFF, "expected ERR packet for wrong password");
-
-    let code = u16::from_le_bytes([err_pkt[1], err_pkt[2]]);
-    assert_eq!(code, 1045, "error code should be 1045 (access denied)");
+    let mut config = test_config(0);
+    config.username = Some("incomplete-config".into());
+    assert!(
+        rustydb::start_wire_server(test_app_state(config), 0)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -858,7 +847,7 @@ async fn test_tcp_create_insert_select() {
         .await
         .expect("connect");
 
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     // CREATE TABLE
     let rows = send_query(
@@ -929,7 +918,7 @@ async fn test_tcp_system_queries() {
         .await
         .expect("connect");
 
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     // SET command should return OK (no rows)
     let rows = send_query(&mut stream, "SET NAMES utf8mb4").await;
@@ -978,7 +967,7 @@ async fn test_tcp_init_db_and_field_list() {
         .await
         .expect("connect");
 
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     // COM_INIT_DB
     let mut payload = vec![COM_INIT_DB];
@@ -1012,7 +1001,7 @@ async fn test_tcp_unsupported_command() {
         .await
         .expect("connect");
 
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     // Send an unsupported command byte (0xFF is not a valid MySQL command)
     write_packet(&mut stream, 0, &[0xFF]).await;
@@ -1034,7 +1023,7 @@ async fn test_tcp_binary_prepared_statement() {
         let _ = rustydb::start_wire_server(wire_state, port).await;
     });
     let mut stream = connect_with_retry(port).await;
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     let mut prepare = vec![COM_STMT_PREPARE];
     prepare.extend_from_slice(b"SELECT ? AS answer");
@@ -1089,7 +1078,7 @@ async fn test_tcp_prepared_empty_result_uses_declared_metadata() {
         let _ = rustydb::start_wire_server(wire_state, port).await;
     });
     let mut stream = connect_with_retry(port).await;
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
     send_query(
         &mut stream,
         "CREATE TABLE prepared_types (id INT PRIMARY KEY)",
@@ -1146,7 +1135,7 @@ async fn test_tcp_malformed_prepared_commands_keep_connection_alive() {
         let _ = rustydb::start_wire_server(wire_state, port).await;
     });
     let mut stream = connect_with_retry(port).await;
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     let mut prepare = vec![COM_STMT_PREPARE];
     prepare.extend_from_slice(b"SELECT 1");
@@ -1194,7 +1183,7 @@ async fn test_tcp_multiple_queries_same_connection() {
         .await
         .expect("connect");
 
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     // Execute many queries in sequence on the same connection
     for i in 1..=10 {
@@ -1224,8 +1213,8 @@ async fn test_tcp_transaction_statements() {
         .await
         .expect("connect observer");
 
-    do_handshake(&mut stream, "test", "").await;
-    do_handshake(&mut observer, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
+    do_handshake_without_auth(&mut observer, "test").await;
 
     send_query(
         &mut stream,
@@ -1296,8 +1285,8 @@ async fn test_tcp_transaction_serialization_conflict() {
     let mut second = TcpStream::connect(format!("127.0.0.1:{port}"))
         .await
         .expect("connect second");
-    do_handshake(&mut first, "test", "").await;
-    do_handshake(&mut second, "test", "").await;
+    do_handshake_without_auth(&mut first, "test").await;
+    do_handshake_without_auth(&mut second, "test").await;
 
     send_query(
         &mut first,
@@ -1521,7 +1510,7 @@ async fn test_tcp_concurrent_connections() {
                 .await
                 .expect("connect");
 
-            do_handshake(&mut stream, &format!("user{}", i), "").await;
+            do_handshake_without_auth(&mut stream, &format!("user{}", i)).await;
 
             let rows = send_query(&mut stream, "SELECT 1").await;
             assert_eq!(rows.len(), 1);
@@ -1552,7 +1541,7 @@ async fn test_tcp_select_database_and_user() {
         .await
         .expect("connect");
 
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     // SELECT DATABASE()
     let rows = send_query(&mut stream, "SELECT DATABASE()").await;
@@ -1586,7 +1575,7 @@ async fn test_tcp_show_warnings() {
         .await
         .expect("connect");
 
-    do_handshake(&mut stream, "test", "").await;
+    do_handshake_without_auth(&mut stream, "test").await;
 
     // SHOW WARNINGS should return an empty result set (3 columns, 0 rows)
     let rows = send_query(&mut stream, "SHOW WARNINGS").await;
