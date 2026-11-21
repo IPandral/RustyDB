@@ -1,6 +1,6 @@
 [package]
 name = "rustydb"
-version = "0.3.0-beta"
+version = "1.0.0"
 edition = "2024"
 authors = ["Matthew Revill"]
 description = "A high-performance in-memory key-value store with SQL support"

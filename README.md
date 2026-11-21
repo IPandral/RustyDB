@@ -15,7 +15,7 @@ Connect with any standard MySQL client -- `mysql` CLI, Python (`mysql-connector-
 
 ## Features
 
-### Current Beta Release (v0.3.0-beta)
+### Current Release (v1.0.0)
 
 #### Key-Value Store
 - Lock-free concurrent access with DashMap
@@ -195,7 +195,7 @@ Published ports bind to the host loopback address by default. Set `RUSTYDB_PUBLI
 ### Key-Value Mode Usage
 
 ```
-RustyDB v0.3.0-beta
+RustyDB v1.0.0
 Running in Key-Value mode
 
 kv> SET name RustyDB
@@ -216,7 +216,7 @@ user:3: charlie
 ### SQL Mode Usage
 
 ```
-RustyDB v0.3.0-beta
+RustyDB v1.0.0
 Running in SQL mode
 
 sql> CREATE TABLE users (
@@ -433,7 +433,7 @@ RustyDB implements the MySQL client/server protocol v10, allowing standard MySQL
 - **Result encoding**: text rows plus prepared-statement binary rows and prepare-time metadata
 - **Transactions**: each wire connection owns an isolated SQL session
 - **Session autocommit**: enabled on new connections. Use `SET @@session.autocommit = OFF` (or `0`) to start a transaction on the next SQL statement that accesses the database. `COMMIT` publishes changes, and `ROLLBACK` or disconnect discards pending changes. Switching back to `ON` (or `1`) commits pending changes. RustyDB keeps DDL transactional in this mode.
-- **Reports as**: `8.0.99-RustyDB-0.3.0-beta`
+- **Reports as**: `8.0.99-RustyDB-1.0.0`
 
 ### Persistence Architecture
 

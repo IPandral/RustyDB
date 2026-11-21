@@ -44,7 +44,7 @@ pub const COM_STMT_SEND_LONG_DATA: u8 = 0x18;
 pub const COM_STMT_CLOSE: u8 = 0x19;
 pub const COM_STMT_RESET: u8 = 0x1A;
 
-pub const SERVER_VERSION: &str = "8.0.99-RustyDB-0.3.0-beta";
+pub const SERVER_VERSION: &str = concat!("8.0.99-RustyDB-", env!("CARGO_PKG_VERSION"));
 pub const AUTH_PLUGIN: &str = "caching_sha2_password";
 
 // Server capabilities to advertise

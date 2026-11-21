@@ -1156,7 +1156,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "rustydb"
-version = "0.3.0-beta"
+version = "1.0.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
