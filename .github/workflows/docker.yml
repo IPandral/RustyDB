@@ -62,13 +62,26 @@ jobs:
           tls_dir="$RUNNER_TEMP/rustydb-tls"
           mkdir "$tls_dir"
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=RustyDB Test CA' \
+            -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' \
+            -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+            -addext 'subjectKeyIdentifier=hash' \
             -keyout "$RUNNER_TEMP/rustydb-ca.key" -out "$tls_dir/ca.crt"
           openssl req -newkey rsa:2048 -nodes -subj '/CN=localhost' \
-            -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
             -keyout "$tls_dir/server.key" -out "$RUNNER_TEMP/rustydb-server.csr"
+          extensions="$RUNNER_TEMP/rustydb-server.ext"
+          cat > "$extensions" <<'EOF'
+          basicConstraints=critical,CA:FALSE
+          keyUsage=critical,digitalSignature,keyEncipherment
+          extendedKeyUsage=serverAuth
+          subjectAltName=DNS:localhost,IP:127.0.0.1
+          subjectKeyIdentifier=hash
+          authorityKeyIdentifier=keyid
+          EOF
           openssl x509 -req -in "$RUNNER_TEMP/rustydb-server.csr" -days 1 \
             -CA "$tls_dir/ca.crt" -CAkey "$RUNNER_TEMP/rustydb-ca.key" \
-            -CAcreateserial -copy_extensions copy -out "$tls_dir/server.crt"
+            -CAcreateserial -extfile "$extensions" -out "$tls_dir/server.crt"
+          openssl verify -x509_strict -purpose sslserver -verify_ip 127.0.0.1 \
+            -CAfile "$tls_dir/ca.crt" "$tls_dir/server.crt"
           sudo chown 1000 "$tls_dir/server.key"
           password="$(openssl rand -hex 32)"
           printf '::add-mask::%s\n' "$password"
