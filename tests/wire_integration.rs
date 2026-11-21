@@ -643,6 +643,18 @@ async fn do_handshake(stream: &mut TcpStream, username: &str, password: &str) ->
 /// Send a COM_QUERY and read the full response (column count, column defs,
 /// EOF, rows, EOF).  Returns the row data payloads.
 async fn send_query(stream: &mut TcpStream, query: &str) -> Vec<Vec<u8>> {
+    send_query_with_status(stream, query).await.0
+}
+
+fn ok_status(packet: &[u8]) -> u16 {
+    assert_eq!(packet[0], 0x00, "expected OK packet");
+    let mut position = 1;
+    read_lenenc_int(packet, &mut position).unwrap(); // affected rows
+    read_lenenc_int(packet, &mut position).unwrap(); // last insert ID
+    u16::from_le_bytes(packet[position..position + 2].try_into().unwrap())
+}
+
+async fn send_query_with_status(stream: &mut TcpStream, query: &str) -> (Vec<Vec<u8>>, u16) {
     // Build COM_QUERY packet: [0x03] + query bytes
     let mut payload = vec![COM_QUERY];
     payload.extend_from_slice(query.as_bytes());
@@ -653,7 +665,7 @@ async fn send_query(stream: &mut TcpStream, query: &str) -> Vec<Vec<u8>> {
 
     // If the first byte is 0x00 it is an OK packet (e.g. DDL / DML)
     if first[0] == 0x00 {
-        return Vec::new(); // no rows
+        return (Vec::new(), ok_status(&first));
     }
 
     // If the first byte is 0xFF it is an ERR packet
@@ -674,6 +686,7 @@ async fn send_query(stream: &mut TcpStream, query: &str) -> Vec<Vec<u8>> {
     // Read EOF after column defs
     let (_seq, eof1) = read_packet(stream).await;
     assert_eq!(eof1[0], 0xFE, "expected EOF after column defs");
+    let status = u16::from_le_bytes([eof1[3], eof1[4]]);
 
     // Read rows until EOF
     let mut rows = Vec::new();
@@ -681,12 +694,13 @@ async fn send_query(stream: &mut TcpStream, query: &str) -> Vec<Vec<u8>> {
         let (_seq, row_data) = read_packet(stream).await;
         if row_data[0] == 0xFE && row_data.len() < 9 {
             // EOF packet (marker 0xFE with small length)
+            assert_eq!(u16::from_le_bytes([row_data[3], row_data[4]]), status);
             break;
         }
         rows.push(row_data);
     }
 
-    rows
+    (rows, status)
 }
 
 async fn send_query_error(stream: &mut TcpStream, query: &str) -> String {
@@ -1283,6 +1297,197 @@ async fn test_tcp_transaction_serialization_conflict() {
 
     send_quit(&mut first).await;
     send_quit(&mut second).await;
+}
+
+#[tokio::test]
+async fn test_tcp_session_autocommit() {
+    let port = random_port().await;
+    let state = test_app_state(test_config(port));
+    tokio::spawn(async move { rustydb::start_wire_server(state, port).await.unwrap() });
+    let mut writer = connect_with_retry(port).await;
+    let mut observer = connect_with_retry(port).await;
+    do_handshake(&mut writer, "test", "").await;
+    do_handshake(&mut observer, "test", "").await;
+
+    let select_mode = "SELECT @@session.autocommit";
+    let select_rows = "SELECT id FROM wire_autocommit ORDER BY id";
+    assert_eq!(
+        send_query_with_status(&mut writer, select_mode).await,
+        (vec![vec![1, b'1']], SERVER_STATUS_AUTOCOMMIT)
+    );
+    send_query(
+        &mut writer,
+        "CREATE TABLE wire_autocommit (id INT PRIMARY KEY)",
+    )
+    .await;
+    assert_eq!(
+        send_query_with_status(
+            &mut writer,
+            "set\t/* session */ @@SESSION.autocommit = OFF;"
+        )
+        .await
+        .1,
+        0
+    );
+    assert_eq!(
+        send_query_with_status(&mut writer, select_mode).await,
+        (vec![vec![1, b'0']], 0)
+    );
+    assert_eq!(
+        send_query_with_status(&mut observer, select_mode).await,
+        (vec![vec![1, b'1']], SERVER_STATUS_AUTOCOMMIT)
+    );
+
+    assert_eq!(
+        send_query_with_status(&mut writer, "INSERT INTO wire_autocommit VALUES (1)")
+            .await
+            .1,
+        SERVER_STATUS_IN_TRANS
+    );
+    write_packet(&mut writer, 0, &[COM_PING]).await;
+    assert_eq!(
+        ok_status(&read_packet(&mut writer).await.1),
+        SERVER_STATUS_IN_TRANS
+    );
+    assert_eq!(
+        send_query_with_status(&mut writer, select_rows).await,
+        (vec![vec![1, b'1']], SERVER_STATUS_IN_TRANS)
+    );
+    assert!(send_query(&mut observer, select_rows).await.is_empty());
+    let subquery = "SELECT 1 WHERE EXISTS (SELECT id FROM wire_autocommit)";
+    assert_eq!(send_query(&mut writer, subquery).await.len(), 1);
+    assert!(send_query(&mut observer, subquery).await.is_empty());
+    assert_eq!(send_query_with_status(&mut writer, "COMMIT").await.1, 0);
+    assert_eq!(
+        send_query(&mut observer, select_rows).await,
+        vec![vec![1, b'1']]
+    );
+
+    let mut prepare = vec![COM_STMT_PREPARE];
+    prepare.extend_from_slice(b"INSERT INTO wire_autocommit VALUES (?)");
+    write_packet(&mut writer, 0, &prepare).await;
+    let (_, prepared) = read_packet(&mut writer).await;
+    assert_eq!(prepared[0], 0x00);
+    let statement_id = &prepared[1..5];
+    let _ = read_packet(&mut writer).await; // parameter definition
+    assert_eq!(
+        read_packet(&mut writer).await.1,
+        build_eof_packet_with_status(0)
+    );
+
+    let mut execute = vec![COM_STMT_EXECUTE];
+    execute.extend_from_slice(statement_id);
+    execute.push(0); // no cursor
+    execute.extend_from_slice(&1u32.to_le_bytes()); // iteration count
+    execute.extend([0, 1, MYSQL_TYPE_TINY, 0, 2]); // bitmap, type and value
+    write_packet(&mut writer, 0, &execute).await;
+    assert_eq!(
+        ok_status(&read_packet(&mut writer).await.1),
+        SERVER_STATUS_IN_TRANS
+    );
+    assert_eq!(send_query(&mut writer, select_rows).await.len(), 2);
+    assert_eq!(
+        send_query(&mut observer, select_rows).await,
+        vec![vec![1, b'1']]
+    );
+    assert_eq!(send_query_with_status(&mut writer, "ROLLBACK").await.1, 0);
+
+    send_query(&mut writer, "INSERT INTO wire_autocommit VALUES (3)").await;
+    assert_eq!(
+        send_query(&mut observer, select_rows).await,
+        vec![vec![1, b'1']]
+    );
+    assert_eq!(
+        send_query_with_status(&mut writer, "SET @@session.autocommit = ON")
+            .await
+            .1,
+        SERVER_STATUS_AUTOCOMMIT
+    );
+    let committed = vec![vec![1, b'1'], vec![1, b'3']];
+    assert_eq!(send_query(&mut observer, select_rows).await, committed);
+
+    send_query(&mut writer, "SET autocommit = 0").await;
+    send_query(&mut writer, "INSERT INTO wire_autocommit VALUES (4)").await;
+    send_quit(&mut writer).await;
+    assert_eq!(writer.read(&mut [0]).await.unwrap(), 0);
+    assert_eq!(send_query(&mut observer, select_rows).await, committed);
+
+    let mut reconnected = connect_with_retry(port).await;
+    do_handshake(&mut reconnected, "test", "").await;
+    assert_eq!(
+        send_query_with_status(&mut reconnected, select_mode).await,
+        (vec![vec![1, b'1']], SERVER_STATUS_AUTOCOMMIT)
+    );
+}
+
+#[tokio::test]
+async fn test_tcp_autocommit_failed_enable_keeps_session_disabled() {
+    let port = random_port().await;
+    let state = test_app_state(test_config(port));
+    tokio::spawn(async move { rustydb::start_wire_server(state, port).await.unwrap() });
+    let mut first = connect_with_retry(port).await;
+    let mut second = connect_with_retry(port).await;
+    do_handshake(&mut first, "test", "").await;
+    do_handshake(&mut second, "test", "").await;
+    send_query(
+        &mut first,
+        "CREATE TABLE wire_autocommit_conflict (id INT PRIMARY KEY)",
+    )
+    .await;
+    send_query(&mut first, "SET SESSION autocommit = 0").await;
+    send_query(
+        &mut first,
+        "INSERT INTO wire_autocommit_conflict VALUES (1)",
+    )
+    .await;
+    for invalid in [
+        "SET @@session.autocommit = 2",
+        "SET @@session.autocommit = ON; COMMIT",
+        "SET @@session.autocommit = 1, @other = 0",
+        "SET sql_mode = 'TRADITIONAL', autocommit = 1",
+        "SET @@global.autocommit = ON",
+        "SET GLOBAL autocommit = ON",
+    ] {
+        send_query_error(&mut first, invalid).await;
+    }
+    assert_eq!(
+        send_query_with_status(&mut first, "SELECT @@autocommit, @@global.autocommit").await,
+        (vec![vec![1, b'0', 1, b'1']], SERVER_STATUS_IN_TRANS)
+    );
+    send_query(
+        &mut second,
+        "INSERT INTO wire_autocommit_conflict VALUES (2)",
+    )
+    .await;
+    let error = send_query_error(&mut first, "SET @@session.autocommit = 1").await;
+    assert!(error.contains("Serialization conflict"));
+    assert_eq!(
+        send_query_with_status(&mut first, "SELECT @@session.autocommit").await,
+        (vec![vec![1, b'0']], 0)
+    );
+    send_query(
+        &mut first,
+        "INSERT INTO wire_autocommit_conflict VALUES (3)",
+    )
+    .await;
+    assert_eq!(
+        send_query(&mut second, "SELECT id FROM wire_autocommit_conflict").await,
+        vec![vec![1, b'2']]
+    );
+    assert_eq!(
+        send_query_with_status(&mut first, "SET @@session.autocommit = 1")
+            .await
+            .1,
+        SERVER_STATUS_AUTOCOMMIT
+    );
+    assert_eq!(
+        send_query(
+            &mut second,
+            "SELECT id FROM wire_autocommit_conflict ORDER BY id"
+        )
+        .await,
+        vec![vec![1, b'2'], vec![1, b'3']]
+    );
 }
 
 #[tokio::test]

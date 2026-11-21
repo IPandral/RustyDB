@@ -26,6 +26,7 @@ import argparse
 import os
 import sys
 import traceback
+from uuid import uuid4
 
 try:
     import mysql.connector
@@ -228,6 +229,44 @@ def build_tests(runner):
         conn.close()
 
     tests.append(("Connection", test_connection))
+
+    def test_autocommit_and_prepared_transaction():
+        table = f"{TEST_TABLE}_tx_{uuid4().hex}"
+        with runner.connect() as observer:
+            observer.autocommit = True
+            with observer.cursor() as cursor:
+                cursor.execute(f"CREATE TABLE {table} (id INT PRIMARY KEY)")
+            try:
+                with runner.connect() as writer:
+                    assert writer.autocommit is False
+                    with writer.cursor(prepared=True) as cursor:
+                        cursor.execute(f"INSERT INTO {table} VALUES (%s)", (1,))
+                    assert writer.in_transaction
+                    assert fetch_all(observer, f"SELECT id FROM {table}") == []
+                    writer.commit()
+                    assert fetch_all(observer, f"SELECT id FROM {table}") == [(1,)]
+
+                    writer.start_transaction()
+                    with writer.cursor(prepared=True) as cursor:
+                        cursor.execute(f"INSERT INTO {table} VALUES (%s)", (2,))
+                    writer.rollback()
+                    assert fetch_all(observer, f"SELECT id FROM {table}") == [(1,)]
+
+                    with writer.cursor(prepared=True) as cursor:
+                        cursor.execute(f"INSERT INTO {table} VALUES (%s)", (3,))
+                    writer.autocommit = True
+                    assert writer.autocommit is True
+                    assert fetch_all(
+                        observer, f"SELECT id FROM {table} ORDER BY id"
+                    ) == [(1,), (3,)]
+            finally:
+                with observer.cursor() as cursor:
+                    cursor.execute(f"DROP TABLE {table}")
+
+    tests.append((
+        "Session autocommit and prepared transactions",
+        test_autocommit_and_prepared_transaction,
+    ))
 
     # ------------------------------------------------------------------
     # 2. Ping Test
@@ -654,7 +693,7 @@ def main():
         print(f"  Error: {e}")
         print()
         print("Make sure the RustyDB server is running with the wire protocol enabled.")
-        print("  Example:  cargo run -- --wire-port 3307")
+        print("  Example:  cargo run --features server -- --server --memory")
         print()
         sys.exit(1)
     except Exception as e:
