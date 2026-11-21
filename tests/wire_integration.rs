@@ -619,6 +619,17 @@ fn test_parse_client_handshake_capabilities() {
 /// Perform the full MySQL handshake on an already-connected TCP stream.
 /// Returns the scramble used by the server.
 async fn do_handshake(stream: &mut TcpStream, username: &str, password: &str) -> [u8; 20] {
+    do_handshake_with_token(stream, username, |scramble| {
+        compute_auth_token(password, scramble)
+    })
+    .await
+}
+
+async fn do_handshake_with_token(
+    stream: &mut TcpStream,
+    username: &str,
+    build_auth_token: impl FnOnce(&[u8; 20]) -> Vec<u8>,
+) -> [u8; 20] {
     // 1. Read the server greeting (seq 0)
     let (seq, greeting) = read_packet(stream).await;
     assert_eq!(seq, 0, "greeting should have sequence id 0");
@@ -628,7 +639,7 @@ async fn do_handshake(stream: &mut TcpStream, username: &str, password: &str) ->
     let scramble = extract_scramble_from_greeting(&greeting);
 
     // 3. Build and send the client handshake response (seq 1)
-    let auth_token = compute_auth_token(password, &scramble);
+    let auth_token = build_auth_token(&scramble);
     let response = build_client_handshake_response(username, &auth_token, None);
     write_packet(stream, 1, &response).await;
 
@@ -638,6 +649,12 @@ async fn do_handshake(stream: &mut TcpStream, username: &str, password: &str) ->
     assert_eq!(ok_pkt[0], 0x00, "expected OK packet after handshake");
 
     scramble
+}
+
+async fn connect_without_auth(port: u16) -> TcpStream {
+    let mut stream = connect_with_retry(port).await;
+    do_handshake_with_token(&mut stream, "test", |_| Vec::new()).await;
+    stream
 }
 
 /// Send a COM_QUERY and read the full response (column count, column defs,
@@ -1304,10 +1321,8 @@ async fn test_tcp_session_autocommit() {
     let port = random_port().await;
     let state = test_app_state(test_config(port));
     tokio::spawn(async move { rustydb::start_wire_server(state, port).await.unwrap() });
-    let mut writer = connect_with_retry(port).await;
-    let mut observer = connect_with_retry(port).await;
-    do_handshake(&mut writer, "test", "").await;
-    do_handshake(&mut observer, "test", "").await;
+    let mut writer = connect_without_auth(port).await;
+    let mut observer = connect_without_auth(port).await;
 
     let select_mode = "SELECT @@session.autocommit";
     let select_rows = "SELECT id FROM wire_autocommit ORDER BY id";
@@ -1412,8 +1427,7 @@ async fn test_tcp_session_autocommit() {
     assert_eq!(writer.read(&mut [0]).await.unwrap(), 0);
     assert_eq!(send_query(&mut observer, select_rows).await, committed);
 
-    let mut reconnected = connect_with_retry(port).await;
-    do_handshake(&mut reconnected, "test", "").await;
+    let mut reconnected = connect_without_auth(port).await;
     assert_eq!(
         send_query_with_status(&mut reconnected, select_mode).await,
         (vec![vec![1, b'1']], SERVER_STATUS_AUTOCOMMIT)
@@ -1425,10 +1439,8 @@ async fn test_tcp_autocommit_failed_enable_keeps_session_disabled() {
     let port = random_port().await;
     let state = test_app_state(test_config(port));
     tokio::spawn(async move { rustydb::start_wire_server(state, port).await.unwrap() });
-    let mut first = connect_with_retry(port).await;
-    let mut second = connect_with_retry(port).await;
-    do_handshake(&mut first, "test", "").await;
-    do_handshake(&mut second, "test", "").await;
+    let mut first = connect_without_auth(port).await;
+    let mut second = connect_without_auth(port).await;
     send_query(
         &mut first,
         "CREATE TABLE wire_autocommit_conflict (id INT PRIMARY KEY)",
