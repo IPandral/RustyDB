@@ -569,11 +569,7 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
     // Disable Nagle for lower latency
     let _ = stream.set_nodelay(true);
 
-    let peer = stream
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
-    eprintln!("[wire] Connection {} from {}", conn_id, peer);
+    eprintln!("[wire] Connection {conn_id} accepted");
 
     // === HANDSHAKE PHASE ===
 
@@ -611,16 +607,9 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
     };
 
     if !auth_ok {
-        let err = build_err_packet(
-            1045,
-            "28000",
-            &format!("Access denied for user '{}'@'{}'", handshake.username, peer),
-        );
+        let err = build_err_packet(1045, "28000", "Access denied");
         let _ = write_packet(&mut stream, 2, &err).await;
-        eprintln!(
-            "[wire] Auth failed for user '{}' from {}",
-            handshake.username, peer
-        );
+        eprintln!("[wire] Authentication failed (connection {conn_id})");
         return;
     }
 
@@ -630,10 +619,7 @@ async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id:
         return;
     }
 
-    eprintln!(
-        "[wire] User '{}' authenticated (conn {})",
-        handshake.username, conn_id
-    );
+    eprintln!("[wire] Handshake completed (connection {conn_id})");
 
     // Each wire connection owns a transaction/session context.
     let session = state.sql_db.session();
