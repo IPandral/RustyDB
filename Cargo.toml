@@ -21,13 +21,21 @@ tokio = { version = "1.43", features = ["full"], optional = true }
 axum = { version = "0.8", optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
 base64 = { version = "0.22", optional = true }
+hyper = { version = "1", features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1", features = ["service", "tokio"], optional = true }
 
-# MySQL wire protocol authentication
-sha1 = { version = "0.10", optional = true }
+# Shared TLS and credential verification for server endpoints
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+getrandom = { version = "0.3", optional = true }
+subtle = { version = "2.6", optional = true }
+zeroize = { version = "1.8", optional = true }
 
 [features]
 default = []
-server = ["tokio", "axum", "tower-http", "base64", "sha1"]
+server = [
+    "tokio", "axum", "tower-http", "base64", "hyper", "hyper-util",
+    "tokio-rustls", "getrandom", "subtle", "zeroize",
+]
 
 [dev-dependencies]
 # For testing and benchmarking
@@ -35,7 +43,7 @@ criterion = "0.5"
 num_cpus = "1.16"
 tempfile = "3.15"
 tokio = { version = "1.43", features = ["full"] }
-sha1 = "0.10"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 
 [[bench]]
 name = "kv_bench"

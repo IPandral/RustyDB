@@ -7,10 +7,23 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use base64::Engine;
+use hyper::server::conn::http1;
+use hyper_util::{rt::TokioIo, service::TowerToHyperService};
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::io;
+use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use subtle::ConstantTimeEq;
+use tokio::net::TcpListener;
+use tokio_rustls::{
+    TlsAcceptor, rustls,
+    rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
+};
 use tower_http::cors::{Any, CorsLayer};
+use zeroize::Zeroizing;
 
 use crate::kvstore::KVStore;
 use crate::sql::{ExecutionResult, SQLDatabase, SQLDatabaseOptions};
@@ -29,6 +42,9 @@ pub struct ServerConfig {
     pub port: u16,
     pub username: Option<String>,
     pub password: Option<String>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    pub allow_unauthenticated_local: bool,
     pub data_dir: String,
     pub memory_only: bool,
     pub wire_port: u16,
@@ -48,6 +64,12 @@ impl ServerConfig {
                 .unwrap_or(8080),
             username: env::var("RUSTYDB_USERNAME").ok(),
             password: env::var("RUSTYDB_PASSWORD").ok(),
+            tls_cert: env::var_os("RUSTYDB_TLS_CERT").map(PathBuf::from),
+            tls_key: env::var_os("RUSTYDB_TLS_KEY").map(PathBuf::from),
+            allow_unauthenticated_local: matches!(
+                env::var("RUSTYDB_ALLOW_UNAUTHENTICATED_LOCAL").as_deref(),
+                Ok("true" | "1")
+            ),
             data_dir: env::var("RUSTYDB_DATA_DIR").unwrap_or_else(|_| "./rustydb_data".to_string()),
             memory_only: env::var("RUSTYDB_MEMORY_ONLY")
                 .map(|v| v == "true" || v == "1")
@@ -72,7 +94,62 @@ impl ServerConfig {
 
     /// Check if authentication is required
     pub fn auth_required(&self) -> bool {
-        self.username.is_some() && self.password.is_some()
+        !self.local_access_allowed()
+    }
+
+    fn local_access_allowed(&self) -> bool {
+        self.allow_unauthenticated_local
+            && self.host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+            && self.username.is_none()
+            && self.password.is_none()
+            && self.tls_cert.is_none()
+            && self.tls_key.is_none()
+    }
+
+    pub(crate) fn credentials_match(&self, username: &[u8], password: &[u8]) -> bool {
+        let Some((expected_user, expected_password)) =
+            self.username.as_ref().zip(self.password.as_ref())
+        else {
+            return false;
+        };
+        bool::from(
+            expected_user.as_bytes().ct_eq(username) & expected_password.as_bytes().ct_eq(password),
+        )
+    }
+
+    pub(crate) fn tls_acceptor(&self) -> Result<Option<TlsAcceptor>, Box<dyn std::error::Error>> {
+        if self.local_access_allowed() {
+            return Ok(None);
+        }
+        if self.allow_unauthenticated_local {
+            return Err("Unauthenticated mode requires a numeric loopback bind address and no credentials or TLS configuration".into());
+        }
+        if !self
+            .username
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty() && !name.contains([':', '\0']))
+            || !self.password.as_deref().is_some_and(|password| {
+                !password.trim().is_empty()
+                    && !password.contains('\0')
+                    && password.len() <= crate::wire::MAX_PASSWORD_BYTES
+            })
+        {
+            return Err("Set a nonempty RUSTYDB_USERNAME and RUSTYDB_PASSWORD with valid MySQL and HTTP Basic credentials".into());
+        }
+        let Some((cert, key)) = self.tls_cert.as_ref().zip(self.tls_key.as_ref()) else {
+            return Err(
+                "Authenticated listeners require RUSTYDB_TLS_CERT and RUSTYDB_TLS_KEY".into(),
+            );
+        };
+        let certificates = CertificateDer::pem_file_iter(cert)?.collect::<Result<Vec<_>, _>>()?;
+        let key = PrivateKeyDer::from_pem_file(key)?;
+        let tls = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_no_client_auth()
+        .with_single_cert(certificates, key)?;
+        Ok(Some(TlsAcceptor::from(Arc::new(tls))))
     }
 }
 
@@ -188,9 +265,6 @@ async fn auth_middleware(
         return next.run(request).await;
     }
 
-    let expected_user = state.config.username.as_ref().unwrap();
-    let expected_pass = state.config.password.as_ref().unwrap();
-
     let auth_header = match headers.get(header::AUTHORIZATION) {
         Some(h) => h,
         None => {
@@ -224,7 +298,7 @@ async fn auth_middleware(
 
     let encoded = &auth_str[6..];
     let decoded = match base64::engine::general_purpose::STANDARD.decode(encoded) {
-        Ok(d) => d,
+        Ok(d) => Zeroizing::new(d),
         Err(_) => {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -234,7 +308,7 @@ async fn auth_middleware(
         }
     };
 
-    let credentials = match String::from_utf8(decoded) {
+    let credentials = match std::str::from_utf8(&decoded) {
         Ok(s) => s,
         Err(_) => {
             return (
@@ -245,18 +319,18 @@ async fn auth_middleware(
         }
     };
 
-    let parts: Vec<&str> = credentials.splitn(2, ':').collect();
-    if parts.len() != 2 {
+    let Some((user, pass)) = credentials.split_once(':') else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(ApiResponse::<()>::error("Invalid credentials format")),
         )
             .into_response();
-    }
+    };
 
-    let (user, pass) = (parts[0], parts[1]);
-
-    if user != expected_user || pass != expected_pass {
+    if !state
+        .config
+        .credentials_match(user.as_bytes(), pass.as_bytes())
+    {
         return (
             StatusCode::UNAUTHORIZED,
             Json(ApiResponse::<()>::error("Invalid username or password")),
@@ -783,8 +857,32 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
-/// Start the HTTP server
+async fn serve_https(listener: TcpListener, app: Router, tls: TlsAcceptor) -> io::Result<()> {
+    let handshake_slots = Arc::new(tokio::sync::Semaphore::new(128));
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let Ok(slot) = Arc::clone(&handshake_slots).try_acquire_owned() else {
+            continue;
+        };
+        let tls = tls.clone();
+        let app = app.clone();
+        tokio::spawn(async move {
+            let handshake = tokio::time::timeout(Duration::from_secs(10), tls.accept(stream)).await;
+            drop(slot);
+            if let Ok(Ok(stream)) = handshake {
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), TowerToHyperService::new(app))
+                    .await;
+            }
+        });
+    }
+}
+
+/// Start the HTTP and MySQL listeners after validating transport security.
 pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let tls = config.tls_acceptor()?;
+    let http_listener = TcpListener::bind((config.host.as_str(), config.port)).await?;
+    let wire_listener = TcpListener::bind((config.host.as_str(), config.wire_port)).await?;
     let kv_store = if config.memory_only {
         KVStore::new()
     } else {
@@ -803,19 +901,19 @@ pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error
             .unwrap_or_else(|_| SQLDatabase::with_options(sql_options))
     };
 
-    let auth_msg = if config.auth_required() {
-        "Basic Auth ENABLED"
+    let (scheme, auth_msg) = if tls.is_some() {
+        ("https", "TLS with authentication required")
     } else {
-        "No authentication (set RUSTYDB_USERNAME and RUSTYDB_PASSWORD to enable)"
+        ("http", "Unauthenticated local development mode")
     };
 
-    let wire_port = config.wire_port;
-    let addr = format!("{}:{}", config.host, config.port);
+    let wire_addr = wire_listener.local_addr()?;
+    let addr = http_listener.local_addr()?;
     println!("RustyDB REST API Server v{}", RUSTYDB_VERSION);
     println!("=================================");
     print_outdated_version_warning();
-    println!("  HTTP API:  http://{}", addr);
-    println!("  MySQL Wire: {}:{}", config.host, wire_port);
+    println!("  HTTP API:   {scheme}://{addr}");
+    println!("  MySQL Wire: {wire_addr}");
     println!("  Auth:      {}", auth_msg);
     println!("  Data dir:  {}", config.data_dir);
     println!(
@@ -839,22 +937,6 @@ pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error
     println!("  GET    /sql/tables       - List tables");
     println!("  POST   /sql/save         - Save database");
     println!();
-    println!("MySQL Wire Protocol:");
-    println!("  Connect with any MySQL client on port {}", wire_port);
-    println!(
-        "  Example: mysql -h 127.0.0.1 -P {} -u <user> -p",
-        wire_port
-    );
-    println!(
-        "  Python:  mysql.connector.connect(host='127.0.0.1', port={}, ...)",
-        wire_port
-    );
-    println!(
-        "  Rust:    mysql::Conn::new(\"mysql://user:pass@127.0.0.1:{}/rustydb\")",
-        wire_port
-    );
-    println!();
-
     let state = Arc::new(AppState {
         kv_store,
         sql_db,
@@ -863,18 +945,15 @@ pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error
 
     let app = create_router(state.clone());
 
-    // Spawn MySQL wire protocol server
-    let wire_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        if let Err(e) = crate::wire::start_wire_server(wire_state, wire_port).await {
-            eprintln!("[wire] Wire protocol server error: {}", e);
-        }
-    });
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("Server started! Press Ctrl+C to stop.\n");
-
-    axum::serve(listener, app).await?;
+    let wire = crate::wire::serve_wire(wire_listener, state, tls.clone());
+    let http = async {
+        match tls {
+            Some(tls) => serve_https(http_listener, app, tls).await,
+            None => axum::serve(http_listener, app).await,
+        }
+    };
+    tokio::try_join!(wire, http)?;
 
     Ok(())
 }

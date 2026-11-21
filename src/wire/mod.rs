@@ -3,16 +3,25 @@ pub mod protocol;
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::tokenizer::{Token, Tokenizer};
 use std::collections::HashMap;
+use std::io::{self, ErrorKind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
+use zeroize::Zeroizing;
 
-use crate::server::AppState;
+use crate::server::{AppState, ServerConfig};
 use crate::sql::{DataType, ExecutionResult, PreparedStatement, ResultSet, Row, SQLSession, Value};
 use protocol::*;
 
 static NEXT_CONNECTION_ID: AtomicU32 = AtomicU32::new(1);
+const MAX_HANDSHAKE_PACKET: usize = 16 * 1024;
+pub(crate) const MAX_PASSWORD_BYTES: usize = 1024;
+
+trait WireStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> WireStream for T {}
 
 struct WirePreparedStatement {
     prepared: PreparedStatement,
@@ -20,7 +29,14 @@ struct WirePreparedStatement {
     long_data: HashMap<usize, Vec<u8>>,
 }
 
-async fn read_packet(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
+async fn read_packet(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<(u8, Vec<u8>)> {
+    read_limited_packet(stream, 0xFF_FF_FF).await
+}
+
+async fn read_limited_packet(
+    stream: &mut (impl AsyncRead + Unpin),
+    limit: usize,
+) -> io::Result<(u8, Vec<u8>)> {
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).await?;
 
@@ -28,13 +44,23 @@ async fn read_packet(stream: &mut TcpStream) -> std::io::Result<(u8, Vec<u8>)> {
         (header[0] as usize) | ((header[1] as usize) << 8) | ((header[2] as usize) << 16);
     let seq_id = header[3];
 
+    if payload_len > limit {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "MySQL packet exceeds size limit",
+        ));
+    }
     let mut payload = vec![0u8; payload_len];
     stream.read_exact(&mut payload).await?;
 
     Ok((seq_id, payload))
 }
 
-async fn write_packet(stream: &mut TcpStream, seq_id: u8, payload: &[u8]) -> std::io::Result<()> {
+async fn write_packet(
+    stream: &mut (impl AsyncWrite + Unpin),
+    seq_id: u8,
+    payload: &[u8],
+) -> io::Result<()> {
     let len = payload.len();
     let header = [
         (len & 0xFF) as u8,
@@ -51,7 +77,7 @@ async fn write_packet(stream: &mut TcpStream, seq_id: u8, payload: &[u8]) -> std
 /// Write multiple payloads as sequential packets with incrementing sequence IDs.
 /// Returns the next sequence ID after the last packet sent.
 async fn write_packets(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncWrite + Unpin),
     start_seq: u8,
     payloads: &[Vec<u8>],
 ) -> std::io::Result<u8> {
@@ -565,60 +591,82 @@ fn encode_result_set(rs: &ResultSet, table_name: &str, status: u16) -> Vec<Vec<u
     packets
 }
 
-async fn handle_connection(state: Arc<AppState>, mut stream: TcpStream, conn_id: u32) {
-    // Disable Nagle for lower latency
-    let _ = stream.set_nodelay(true);
-
-    eprintln!("[wire] Connection {conn_id} accepted");
-
-    // === HANDSHAKE PHASE ===
-
-    // Generate scramble and send server greeting
-    let scramble = generate_scramble(conn_id);
-    let greeting = build_handshake_v10(conn_id, &scramble);
-    if write_packet(&mut stream, 0, &greeting).await.is_err() {
-        return;
+async fn complete_handshake(
+    mut stream: TcpStream,
+    config: &ServerConfig,
+    tls: Option<TlsAcceptor>,
+    conn_id: u32,
+) -> io::Result<Box<dyn WireStream>> {
+    let scramble = generate_scramble().map_err(|error| io::Error::other(error.to_string()))?;
+    write_packet(
+        &mut stream,
+        0,
+        &build_handshake_v10(conn_id, &scramble, tls.is_some()),
+    )
+    .await?;
+    let (sequence, packet) = read_limited_packet(&mut stream, MAX_HANDSHAKE_PACKET).await?;
+    if sequence != 1 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "Unexpected handshake packet sequence",
+        ));
     }
 
-    // Read client handshake response
-    let (_seq, client_data) = match read_packet(&mut stream).await {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-
-    let handshake = match parse_client_handshake(&client_data) {
-        Ok(h) => h,
-        Err(e) => {
-            let err = build_err_packet(1045, "28000", &format!("Bad handshake: {}", e));
-            let _ = write_packet(&mut stream, 2, &err).await;
-            return;
+    let Some(acceptor) = tls else {
+        let handshake = parse_client_handshake(&packet).map_err(io::Error::other)?;
+        if handshake.capabilities & (CLIENT_SSL | CLIENT_PROTOCOL_41) != CLIENT_PROTOCOL_41 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "Unsupported local handshake",
+            ));
         }
+        write_packet(&mut stream, 2, &build_ok_packet(0, 0)).await?;
+        return Ok(Box::new(stream));
     };
 
-    // Authenticate
-    let auth_ok = if state.config.auth_required() {
-        let expected_user = state.config.username.as_ref().unwrap();
-        let expected_pass = state.config.password.as_ref().unwrap();
-
-        handshake.username == *expected_user
-            && verify_mysql_native_password(expected_pass, &scramble, &handshake.auth_response)
-    } else {
-        true // No auth configured, accept all connections
-    };
-
-    if !auth_ok {
-        let err = build_err_packet(1045, "28000", "Access denied");
-        let _ = write_packet(&mut stream, 2, &err).await;
-        eprintln!("[wire] Authentication failed (connection {conn_id})");
-        return;
+    // Only the fixed-size SSLRequest is accepted before TLS on an authenticated listener.
+    let ssl_flags = CLIENT_SSL | CLIENT_PROTOCOL_41;
+    if packet.len() != 32
+        || u32::from_le_bytes(packet[..4].try_into().unwrap()) & ssl_flags != ssl_flags
+    {
+        let error = build_err_packet(3159, "HY000", "TLS is required for authentication");
+        write_packet(&mut stream, 2, &error).await?;
+        return Err(io::Error::new(ErrorKind::PermissionDenied, "TLS required"));
+    }
+    let mut stream = acceptor.accept(stream).await?;
+    let (sequence, packet) = read_limited_packet(&mut stream, MAX_HANDSHAKE_PACKET).await?;
+    let handshake = parse_client_handshake(&packet).map_err(io::Error::other)?;
+    if sequence != 2
+        || handshake.capabilities & ssl_flags != ssl_flags
+        || handshake.auth_plugin.as_deref() != Some(AUTH_PLUGIN)
+    {
+        let error = build_err_packet(1045, "28000", "Access denied");
+        write_packet(&mut stream, 3, &error).await?;
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "Unsupported authentication handshake",
+        ));
     }
 
-    // Send OK to complete handshake
-    let ok = build_ok_packet(0, 0);
-    if write_packet(&mut stream, 2, &ok).await.is_err() {
-        return;
+    // Use caching_sha2_password's full authentication exchange after establishing TLS.
+    // RustyDB does not maintain a fast-authentication password hash cache.
+    write_packet(&mut stream, 3, &[0x01, 0x04]).await?;
+    let (sequence, response) = read_limited_packet(&mut stream, MAX_PASSWORD_BYTES + 1).await?;
+    let response = Zeroizing::new(response);
+    let authenticated = sequence == 4
+        && response.strip_suffix(&[0]).is_some_and(|password| {
+            config.credentials_match(handshake.username.as_bytes(), password)
+        });
+    if !authenticated {
+        let error = build_err_packet(1045, "28000", "Access denied");
+        write_packet(&mut stream, 5, &error).await?;
+        return Err(io::Error::new(ErrorKind::PermissionDenied, "Access denied"));
     }
+    write_packet(&mut stream, 5, &build_ok_packet(0, 0)).await?;
+    Ok(Box::new(stream))
+}
 
+async fn handle_commands(state: Arc<AppState>, mut stream: Box<dyn WireStream>, conn_id: u32) {
     eprintln!("[wire] Handshake completed (connection {conn_id})");
 
     // Each wire connection owns a transaction/session context.
@@ -843,18 +891,44 @@ pub async fn start_wire_server(
     state: Arc<AppState>,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let addr = format!("{}:{}", state.config.host, port);
-    let listener = TcpListener::bind(&addr).await?;
+    let tls = state.config.tls_acceptor()?;
+    let listener = TcpListener::bind((state.config.host.as_str(), port)).await?;
+    serve_wire(listener, state, tls).await?;
+    Ok(())
+}
 
-    eprintln!("[wire] MySQL wire protocol listening on {}", addr);
+pub(crate) async fn serve_wire(
+    listener: TcpListener,
+    state: Arc<AppState>,
+    tls: Option<TlsAcceptor>,
+) -> io::Result<()> {
+    eprintln!(
+        "[wire] MySQL wire protocol listening on {}",
+        listener.local_addr()?
+    );
+    let handshake_slots = Arc::new(tokio::sync::Semaphore::new(128));
 
     loop {
-        let (stream, _addr) = listener.accept().await?;
+        let (stream, _) = listener.accept().await?;
+        let Ok(slot) = Arc::clone(&handshake_slots).try_acquire_owned() else {
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
         let state = Arc::clone(&state);
+        let tls = tls.clone();
         let conn_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
 
         tokio::spawn(async move {
-            handle_connection(state, stream, conn_id).await;
+            let handshake = tokio::time::timeout(
+                Duration::from_secs(10),
+                complete_handshake(stream, &state.config, tls, conn_id),
+            )
+            .await;
+            drop(slot);
+            match handshake {
+                Ok(Ok(stream)) => handle_commands(state, stream, conn_id).await,
+                _ => eprintln!("[wire] Handshake failed (connection {conn_id})"),
+            }
         });
     }
 }

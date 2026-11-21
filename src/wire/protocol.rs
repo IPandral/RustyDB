@@ -1,5 +1,4 @@
 use crate::sql::{DataType, Value};
-use sha1::{Digest, Sha1};
 
 // Capability Flags
 pub const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
@@ -7,6 +6,7 @@ pub const CLIENT_FOUND_ROWS: u32 = 0x0000_0002;
 pub const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
 pub const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
 pub const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
+pub const CLIENT_SSL: u32 = 0x0000_0800;
 pub const CLIENT_TRANSACTIONS: u32 = 0x0000_2000;
 pub const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
 pub const CLIENT_MULTI_RESULTS: u32 = 0x0002_0000;
@@ -44,8 +44,8 @@ pub const COM_STMT_SEND_LONG_DATA: u8 = 0x18;
 pub const COM_STMT_CLOSE: u8 = 0x19;
 pub const COM_STMT_RESET: u8 = 0x1A;
 
-// Server version - report as MySQL 5.7 so clients default to mysql_native_password
-pub const SERVER_VERSION: &str = "5.7.99-RustyDB-0.3.0-beta";
+pub const SERVER_VERSION: &str = "8.0.99-RustyDB-0.3.0-beta";
+pub const AUTH_PLUGIN: &str = "caching_sha2_password";
 
 // Server capabilities to advertise
 pub const SERVER_CAPABILITIES: u32 = CLIENT_LONG_PASSWORD
@@ -161,70 +161,29 @@ pub fn read_lenenc_int(data: &[u8], pos: &mut usize) -> Option<u64> {
 // Scramble Generation
 // ============================================================================
 
-pub fn generate_scramble(conn_id: u32) -> [u8; 20] {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-
-    let mut data = Vec::with_capacity(32);
-    data.extend_from_slice(&conn_id.to_le_bytes());
-    data.extend_from_slice(&nanos.to_le_bytes());
-    data.extend_from_slice(&std::process::id().to_le_bytes());
-
-    let hash: [u8; 20] = Sha1::digest(&data).into();
-
-    // MySQL scramble must not contain zero bytes
-    let mut scramble = hash;
-    for b in &mut scramble {
-        if *b == 0 {
-            *b = 1;
+pub fn generate_scramble() -> Result<[u8; 20], getrandom::Error> {
+    let mut scramble = [0; 20];
+    getrandom::fill(&mut scramble)?;
+    // The MySQL handshake carries the nonce as a NUL-terminated string.
+    for byte in &mut scramble {
+        while *byte == 0 {
+            getrandom::fill(std::slice::from_mut(byte))?;
         }
     }
-    scramble
+    Ok(scramble)
 }
-
-// ============================================================================
-// Authentication
-// ============================================================================
-
-/// Verify mysql_native_password authentication.
-///
-/// The client computes: SHA1(password) XOR SHA1(scramble + SHA1(SHA1(password)))
-/// We verify by computing the same from our known plaintext password.
-pub fn verify_mysql_native_password(password: &str, scramble: &[u8], client_auth: &[u8]) -> bool {
-    if password.is_empty() && client_auth.is_empty() {
-        return true;
-    }
-    if client_auth.len() != 20 {
-        return false;
-    }
-
-    let stage1: [u8; 20] = Sha1::digest(password.as_bytes()).into();
-    let stage2: [u8; 20] = Sha1::digest(stage1).into();
-
-    let mut concat = Vec::with_capacity(scramble.len() + 20);
-    concat.extend_from_slice(scramble);
-    concat.extend_from_slice(&stage2);
-    let scramble_hash: [u8; 20] = Sha1::digest(&concat).into();
-
-    let mut expected = [0u8; 20];
-    for i in 0..20 {
-        expected[i] = stage1[i] ^ scramble_hash[i];
-    }
-
-    expected == client_auth
-}
-
 // ============================================================================
 // Packet Builders
 // ============================================================================
 
 /// Build the server's initial handshake v10 packet payload.
-pub fn build_handshake_v10(conn_id: u32, scramble: &[u8; 20]) -> Vec<u8> {
+pub fn build_handshake_v10(conn_id: u32, scramble: &[u8; 20], use_tls: bool) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(128);
+    let capabilities = if use_tls {
+        SERVER_CAPABILITIES | CLIENT_SSL
+    } else {
+        SERVER_CAPABILITIES
+    };
 
     // Protocol version 10
     pkt.push(10);
@@ -243,7 +202,7 @@ pub fn build_handshake_v10(conn_id: u32, scramble: &[u8; 20]) -> Vec<u8> {
     pkt.push(0);
 
     // Capability flags (lower 2 bytes)
-    pkt.extend_from_slice(&((SERVER_CAPABILITIES & 0xFFFF) as u16).to_le_bytes());
+    pkt.extend_from_slice(&(capabilities as u16).to_le_bytes());
 
     // Character set
     pkt.push(CHARSET_UTF8MB4);
@@ -252,7 +211,7 @@ pub fn build_handshake_v10(conn_id: u32, scramble: &[u8; 20]) -> Vec<u8> {
     pkt.extend_from_slice(&SERVER_STATUS_AUTOCOMMIT.to_le_bytes());
 
     // Capability flags (upper 2 bytes)
-    pkt.extend_from_slice(&(((SERVER_CAPABILITIES >> 16) & 0xFFFF) as u16).to_le_bytes());
+    pkt.extend_from_slice(&((capabilities >> 16) as u16).to_le_bytes());
 
     // Auth plugin data length (21 = 20 bytes scramble + NUL)
     pkt.push(21);
@@ -265,7 +224,7 @@ pub fn build_handshake_v10(conn_id: u32, scramble: &[u8; 20]) -> Vec<u8> {
     pkt.push(0);
 
     // Auth plugin name (null-terminated)
-    pkt.extend_from_slice(b"mysql_native_password");
+    pkt.extend_from_slice(AUTH_PLUGIN.as_bytes());
     pkt.push(0);
 
     pkt

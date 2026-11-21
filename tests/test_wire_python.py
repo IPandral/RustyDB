@@ -7,13 +7,15 @@ mysql-connector-python. Validates connection handling, authentication,
 system queries, DDL, DML (INSERT/SELECT/UPDATE/DELETE), and cleanup.
 
 Usage:
-    python test_wire_python.py [--host HOST] [--port PORT] [--user USER] [--password PASSWORD]
+    python test_wire_python.py --ssl-ca CA.pem
+    python test_wire_python.py --local-unauthenticated
 
 Environment variables (overridden by CLI args):
     RUSTYDB_TEST_HOST      default: 127.0.0.1
     RUSTYDB_WIRE_PORT      default: 3307
     RUSTYDB_USERNAME       default: root
     RUSTYDB_PASSWORD       default: (empty)
+    RUSTYDB_TLS_CA         CA file for TLS certificate and hostname verification
 
 Requirements:
     pip install mysql-connector-python
@@ -72,7 +74,16 @@ def parse_args():
         default=os.environ.get("RUSTYDB_PASSWORD", ""),
         help="Password (default: empty)",
     )
-    return parser.parse_args()
+    tls = parser.add_mutually_exclusive_group()
+    tls.add_argument("--ssl-ca", default=os.environ.get("RUSTYDB_TLS_CA"))
+    tls.add_argument("--local-unauthenticated", action="store_true")
+    args = parser.parse_args()
+    if args.local_unauthenticated:
+        if args.password or args.host not in ("127.0.0.1", "::1", "localhost"):
+            parser.error("Local unauthenticated tests require a loopback host and no password")
+    elif not args.ssl_ca or not args.password:
+        parser.error("Authenticated tests require a CA file and a password")
+    return args
 
 
 # ---------------------------------------------------------------------------
@@ -82,11 +93,18 @@ def parse_args():
 class TestRunner:
     """Lightweight test runner that tracks pass/fail counts and prints results."""
 
-    def __init__(self, host, port, user, password):
+    def __init__(self, host, port, user, password, ssl_ca, local_unauthenticated):
         self.host = host
         self.port = port
         self.user = user
         self.password = password
+        self.tls_options = (
+            {"ssl_disabled": True} if local_unauthenticated else {
+                "ssl_ca": ssl_ca,
+                "ssl_verify_cert": True,
+                "ssl_verify_identity": True,
+            }
+        )
         self.passed = 0
         self.failed = 0
         self.results = []
@@ -100,8 +118,8 @@ class TestRunner:
             user=self.user,
             password=self.password,
             connection_timeout=10,
-            auth_plugin="mysql_native_password",
             use_pure=True,
+            **self.tls_options,
         )
 
     def record_pass(self, name):
@@ -680,7 +698,10 @@ def main():
     print("=" * 60)
     print()
 
-    runner = TestRunner(args.host, args.port, args.user, args.password)
+    runner = TestRunner(
+        args.host, args.port, args.user, args.password, args.ssl_ca,
+        args.local_unauthenticated,
+    )
 
     # Verify we can reach the server before running the full suite
     print("Connecting to RustyDB server...")
@@ -693,7 +714,6 @@ def main():
         print(f"  Error: {e}")
         print()
         print("Make sure the RustyDB server is running with the wire protocol enabled.")
-        print("  Example:  cargo run --features server -- --server --memory")
         print()
         sys.exit(1)
     except Exception as e:
