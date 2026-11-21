@@ -28,6 +28,9 @@ env:
   IMAGE_NAME: rustydb
   REGISTRY: ghcr.io
 
+permissions:
+  contents: read
+
 jobs:
   # ===========================================================================
   # Build and Test Docker Image
